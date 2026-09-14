@@ -1,0 +1,59 @@
+# ===========================================================================
+#  .gitignore -- must be in place BEFORE the first `git init`
+#
+#  This repository must never contain NVIDIA binaries. If one is committed even
+#  once it stays in git history forever, and pushing means redistributing it.
+# ===========================================================================
+
+# --- NVIDIA proprietary runtime -- never redistributable -------------------
+nvngx*.dll
+NVVideoEffects.dll
+NVCVImage.dll
+nvVFXVideoSuperRes.dll
+NvOF*.dll
+nvofapi*.dll
+
+# --- our own engine host DLL (built from dlssnr-toolkit, not a source file) --
+dlssnr_host2.dll
+dlssnr_host.dll
+
+# --- the filter build output itself ---------------------------------------
+dlssnr_dshow.dll
+
+# --- SDKs, if anyone drops them here locally ------------------------------
+deps/
+sdk_include/
+sdk_lib/
+rtx_video_sdk/
+rtx_sdk_legal/
+
+# --- build output ---------------------------------------------------------
+build/
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.res
+*.map
+
+# --- runtime logs / probes ------------------------------------------------
+*.log
+*.log.old
+*_perf.on
+*_perf.txt
+host2_log.txt
+
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- local / editor -------------------------------------------------------
+*.user
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

@@ -1,0 +1,15 @@
+; ===========================================================================
+; dlssnr_dshow.def -- export list for the DirectShow filter DLL.
+;
+; Needed because __declspec(dllexport) was not applied to the COM entry points:
+; without these four exports the DLL registers nothing and regsvr32 fails with
+; "the module was loaded but the entry-point DllRegisterServer was not found".
+; A .def file is used (rather than decorating each function) so the names stay
+; undecorated, which is what COM expects.
+; ===========================================================================
+LIBRARY dlssnr_dshow
+EXPORTS
+    DllGetClassObject   PRIVATE
+    DllCanUnloadNow     PRIVATE
+    DllRegisterServer   PRIVATE
+    DllUnregisterServer PRIVATE

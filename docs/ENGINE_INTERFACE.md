@@ -1,0 +1,146 @@
+# Engine interface contract / 引擎接口契约
+
+This filter is a thin DirectShow wrapper. All the actual neural work happens in
+`dlssnr_host2.dll`, which is built in the separate
+**[dlssnr-toolkit](https://github.com/CyanKe/dlssnr-toolkit)** repository.
+
+That makes the exported functions below a **binary interface between two
+repositories**, so they are documented here explicitly: changing a signature on
+one side silently breaks the other.
+
+本滤镜只是 DirectShow 外壳，真正的神经渲染全部发生在 `dlssnr_host2.dll` 里，
+而它是在独立的 **dlssnr-toolkit** 仓库中编译的。因此下面这些导出函数是
+**两个仓库之间的二进制接口** —— 任何一侧改了签名，另一侧会静默失效。
+
+---
+
+## What the filter loads
+
+```
+LoadLibraryW("<dir of dlssnr_dshow.dll>\\dlssnr_host2.dll")
+```
+
+Resolution is relative to the filter DLL's own directory (`g_dir`, filled from
+`GetModuleFileNameW` in `DllMain`). Nothing is hard-coded, so the folder can be
+moved or cloned anywhere.
+
+Then `GetProcAddress` for exactly these symbols. The five the filter actually
+calls are marked **required** — if one is missing, the filter logs the reason and
+stays in pass-through.
+
+| Export | Signature | Used for | Required |
+| --- | --- | --- | --- |
+| `dlssnr2_set_appdir` | `void (const wchar_t* dir)` | where the host finds `nvngx_dlssnr.dll`; must be called **before** the first init | **yes** |
+| `dlssnr2_init` | `int (int w, int h, const wchar_t* logPath)`, returns 1 on success | create the NGX feature at a size | **yes** |
+| `dlssnr2_process` | `int (unsigned char* inBgr, unsigned char* outBgr, int reset)` | one frame, BGR24 in / BGR24 out | **yes** |
+| `dlssnr2_set_options` | `void (int style, float intensity, float localTone, float localStruct, float skinStruct, int autoMask, int uiCorrection)` | live parameter update | **yes** |
+| `dlssnr2_get_sizes` | `void (int* outW, int* outH)` | the size the session actually runs at | **yes** |
+
+> **`dlssnr2_process` outputs BGR24, not RGBA8.** The RGBA variant is a separate
+> entry point, `dlssnr2_process_rgba(inBgr, outRgba, reset)`, which is **BGR in,
+> RGBA out** — the name refers to the output format only. The DirectShow filter
+> converts to/from NV12 itself and uses the plain BGR24 path.
+>
+> The third argument is `reset`, **not** a bit depth. Passing a pixel size there
+> is a silent, hard-to-diagnose bug: the engine would treat it as a truthy flag
+> and reset its temporal history on every frame.
+
+The host also exports these, which the DirectShow filter does **not** use (they
+exist for the Python app): `dlssnr2_process_rgba`, `dlssnr2_submit`,
+`dlssnr2_fetch`, `dlssnr2_pending`, `dlssnr2_drain`, `dlssnr2_shutdown`,
+`dlssnr2_set_preset`, `dlssnr2_set_mvec_scale`, `dlssnr2_set_aux`,
+`dlssnr2_mvec_const`, `dlssnr2_aux_test`.
+
+`dlssnr2_set_appdir` matters for the filter specifically: the filter runs inside
+a **player's** process, so the host cannot assume the working directory is the
+tool's folder. The filter calls it before `dlssnr2_init` to point the host at the
+filter's own directory.
+
+**Note:** parameter values are passed as **percentages 0–100**, not 0–1
+fractions. The DirectShow filter and the Python app agree on this; changing it
+on one side alone would scale the effect wrongly by 100×.
+
+---
+
+## Buffer contracts
+
+Both `process` entry points use **tightly packed** system memory — no stride
+padding. DirectShow allocates with `cbBuffer` exactly equal to the packed frame
+size, and the filter repacks into scratch buffers if a downstream allocator ever
+hands it a padded stride.
+
+| Function | Input | Output |
+| --- | --- | --- |
+| `dlssnr2_process` | `w*h*3` bytes, BGR24 | `w*h*4` bytes, RGBA8 |
+| `dlssnr2_process_rgba` | `w*h*4` bytes, RGBA8 | `w*h*4` bytes, RGBA8 |
+
+`MEDIASUBTYPE_RGB24` in DirectShow is **B, G, R in memory** (the Windows DIB
+convention — the subtype name lies). That matches `dlssnr2_process` byte for
+byte, with no channel swap. This is not a coincidence to be "fixed" later.
+
+---
+
+## One size per process
+
+NGX allows **only one feature size per process**. Changing size in-process makes
+`Init_Ext` fail with `0xBAD00002`.
+
+So if a player opens a second video with different dimensions without restarting,
+the engine cannot be resized. The filter detects this (the `reason` code says the
+resolution does not match the engine session) and passes frames through rather
+than showing corrupted output. Restarting the player is the fix.
+
+`dlssnr2_get_sizes` exists so the filter can report the session's real size to the
+control panel instead of guessing.
+
+---
+
+## Initialisation is one-shot and slow
+
+Loading the network costs roughly **1–15 seconds** (first run uncached, then
+driver-cached at about 1.3 s). Two consequences the filter is built around:
+
+1. **Init runs on a worker thread.** Blocking `Connect()` or `Pause()` for that
+   long would freeze the player. Every frame passes through untouched until
+   `Ready()` flips.
+2. **Init failure is latched after 3 attempts.** Retrying on every wake-up spun a
+   core and flooded the log — an actual bug that was fixed.
+
+`NVSDK_NGX_D3D11_Shutdown1` **hangs forever** in this configuration, so the host
+never shuts NGX down. Do not add a shutdown call.
+
+The same is true of `NvVFX_DestroyEffect` in the RTX Video path — sessions are
+pooled by size and the quality level is switched in place instead.
+
+---
+
+## Shared-memory control channel
+
+The control panel (`dlssnr_panel.py`) talks to the filter through a named shared
+mapping, not through COM:
+
+```
+Local\DLSSNR_DShow_Shared_v1
+```
+
+A 364-byte packed struct with magic `0x4E534C44` (`'DLSN'`). The layout must match
+on both sides bit for bit — see `SharedState` in `dlssnr_panel.py` and the
+`SharedState` struct in `dlssnr_dshow.cpp`. There is a `structSize` field so a
+mismatch can be detected rather than misread.
+
+Direction of travel:
+
+- **panel -> filter**: `reqEnabled`, `reqStyle`, `reqIntensity`, `reqTone`, `reqStrct`, `reqSeq`
+- **filter -> panel**: `heartbeat`, `framesSeen`, `framesProcessed`, `framesPassthrough`, `engineReady`, `lastReason`, geometry, `pid`, `lastProcessMs`, `reqApplied`
+
+The filter applies requests **before** processing the frame and publishes
+telemetry **after**, so a slider change lands on the very frame it is picked up.
+Doing both at the end costs one frame of visible lag — that was also a real bug.
+
+---
+
+## Versioning
+
+There is no version negotiation. Treat a change to any signature or to the
+`SharedState` layout as a **breaking change** requiring both repositories to be
+released together.
