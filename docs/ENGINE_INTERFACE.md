@@ -80,18 +80,41 @@ byte, with no channel swap. This is not a coincidence to be "fixed" later.
 
 ---
 
-## One size per process
+## Lifetime contract: the host must stay loaded
 
-NGX allows **only one feature size per process**. Changing size in-process makes
-`Init_Ext` fail with `0xBAD00002`.
+`NVSDK_NGX_D3D12_Init_Ext` may be called **once per process**. The host keeps that
+latch inside its own DLL image (`static bool ngxInited` in `dlssnr_host2.cpp`), so
+unloading `dlssnr_host2.dll` and loading it again **resets the latch while NGX
+itself is still initialised in the process**. The next `Init_Ext` then fails with
+`0xBAD00002` (`FAIL_PlatformError`) and the engine stays dead until that process
+exits.
 
-So if a player opens a second video with different dimensions without restarting,
-the engine cannot be resized. The filter detects this (the `reason` code says the
-resolution does not match the engine session) and passes frames through rather
-than showing corrupted output. Restarting the player is the fix.
+That is exactly what a player does when it opens another file: it builds a **new
+filter instance**. Therefore:
+
+- **The filter must never `FreeLibrary` the host.** `Engine` in `dlssnr_dshow.cpp`
+  is a process-wide singleton (`Engine::Instance()`) that is deliberately leaked,
+  and it additionally pins the filter DLL via `GET_MODULE_HANDLE_EX_FLAG_PIN`,
+  because its worker thread executes inside that module.
+- An earlier revision used a **per-filter-instance** engine and called
+  `FreeLibrary` from `~Engine`. Every video change then produced
+  `Init_Ext fail 0xBAD00002` and permanent pass-through until the player itself
+  was restarted. **Do not reintroduce that.**
+
+**Resizing does work in-process.** While the host stays loaded, `dlssnr2_init()`
+at a new size reuses the D3D12 device, drops the old feature via
+`ReleaseFeatureAndTextures()` and rebuilds it at the new geometry. Measured in a
+single process: 1920x1080 -> 1280x720 -> 3840x2160 -> 1920x1080, all four
+succeeded. The former "one size per process / restart the player" claim was an
+artefact of the unload bug, not an NGX limitation.
 
 `dlssnr2_get_sizes` exists so the filter can report the session's real size to the
 control panel instead of guessing.
+
+**中文摘要**：NGX 的 `Init_Ext` 每进程只能调用一次，而 host 把这个标志存在自己的
+DLL 映像里。过滤器**绝不可以 `FreeLibrary` host**，否则换视频时标志被清零、NGX
+却仍处于已初始化状态，第二次 `Init_Ext` 会以 `0xBAD00002` 失败，直到重启播放器。
+保持 host 加载后，**同进程内换分辨率是正常工作的**。
 
 ---
 
@@ -103,8 +126,11 @@ driver-cached at about 1.3 s). Two consequences the filter is built around:
 1. **Init runs on a worker thread.** Blocking `Connect()` or `Pause()` for that
    long would freeze the player. Every frame passes through untouched until
    `Ready()` flips.
-2. **Init failure is latched after 3 attempts.** Retrying on every wake-up spun a
-   core and flooded the log — an actual bug that was fixed.
+2. **Init failure is latched after 3 attempts per geometry.** Retrying on every
+   wake-up spun a core and flooded the log — an actual bug that was fixed. Because
+   the engine now lives for the whole process, `Engine::NewSession()` (called when
+   a new filter instance appears) clears that latch, so one bad file cannot
+   disable DLSSNR for every later file.
 
 `NVSDK_NGX_D3D11_Shutdown1` **hangs forever** in this configuration, so the host
 never shuts NGX down. Do not add a shutdown call.
@@ -114,33 +140,39 @@ pooled by size and the quality level is switched in place instead.
 
 ---
 
-## Shared-memory control channel
+## Shared-memory block: telemetry only
 
-The control panel (`dlssnr_panel.py`) talks to the filter through a named shared
-mapping, not through COM:
+The control panel is a **native Win32 window inside the filter DLL**
+(`src/dlssnr_ui.h`), so it needs no IPC to drive the engine -- it calls
+`Engine::SetOptions()` directly. The named block still exists because the filter
+publishes its live telemetry through it:
 
 ```
 Local\DLSSNR_DShow_Shared_v1
 ```
 
-A 364-byte packed struct with magic `0x4E534C44` (`'DLSN'`). The layout must match
-on both sides bit for bit — see `SharedState` in `dlssnr_panel.py` and the
-`SharedState` struct in `dlssnr_dshow.cpp`. There is a `structSize` field so a
-mismatch can be detected rather than misread.
+A 364-byte packed struct with magic `0x4E534C44` (`'DLSN'`). One producer (the
+filter) and one consumer (the panel, same process), with a `structSize` field so
+a layout mismatch is detected rather than misread. The `SharedState` struct is
+defined in `dlssnr_dshow.cpp`.
 
-Direction of travel:
+- **filter -> panel**: `heartbeat`, `framesSeen`, `framesProcessed`,
+  `framesPassthrough`, `engineReady`, `engineGaveUp`, `lastReason`, `engineW/H`,
+  `videoW/H`, `inputBpp`, `pid`, `lastProcessMs`, `status`
+- **panel -> filter** (`req*`, `reqSeq`): **legacy and unused.** This direction
+  only ever existed so the old out-of-process Python panel could push parameters.
+  The in-process panel writes the ini and calls `Engine::SetOptions()` instead.
+  The fields are kept because dropping them would change the struct layout for no
+  benefit.
 
-- **panel -> filter**: `reqEnabled`, `reqStyle`, `reqIntensity`, `reqTone`, `reqStrct`, `reqSeq`
-- **filter -> panel**: `heartbeat`, `framesSeen`, `framesProcessed`, `framesPassthrough`, `engineReady`, `lastReason`, geometry, `pid`, `lastProcessMs`, `reqApplied`
-
-The filter applies requests **before** processing the frame and publishes
+The filter applies any pending request **before** processing a frame and publishes
 telemetry **after**, so a slider change lands on the very frame it is picked up.
-Doing both at the end costs one frame of visible lag — that was also a real bug.
 
 ---
 
 ## Versioning
 
-There is no version negotiation. Treat a change to any signature or to the
-`SharedState` layout as a **breaking change** requiring both repositories to be
-released together.
+There is no version negotiation on the host interface. Treat a change to any
+signature in this file as a **breaking change** requiring `dlssnr-toolkit` and
+`dlssnr-filter` to be released together. `SharedState` is private to this
+repository now (filter <-> its own panel) and can change freely.

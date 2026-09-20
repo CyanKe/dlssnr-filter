@@ -1,0 +1,4 @@
+# Keep these CRLF in the working tree. The Win32 profile API only understands
+# CRLF, and cmd.exe batch files are fragile with LF-only line endings.
+*.bat text eol=crlf
+*.ini text eol=crlf

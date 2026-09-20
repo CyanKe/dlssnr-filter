@@ -46,6 +46,12 @@
 static const GUID CLSID_DlssNrFilter =
 { 0x3a44ceb0, 0xb660, 0x4131, { 0xa9, 0x65, 0x0e, 0xe8, 0xba, 0x54, 0x7c, 0x26 } };
 
+// Property page CLSID: {7E4B1C2A-5D3F-4A18-9C6E-2B8F0D51A734}
+// Its own CLSID because the player's property frame creates the page itself,
+// via CoCreateInstance, once our filter hands it over from GetPages().
+static const GUID CLSID_DlssNrPage =
+{ 0x7e4b1c2a, 0x5d3f, 0x4a18, { 0x9c, 0x6e, 0x2b, 0x8f, 0x0d, 0x51, 0xa7, 0x34 } };
+
 static const wchar_t* kFilterName = L"DLSS Neural Render (DLSSNR)";
 static const wchar_t* kIniName    = L"dlssnr_dshow.ini";
 static const wchar_t* kLogName    = L"dlssnr_dshow.log";
@@ -362,6 +368,30 @@ typedef void (*FnGetSizes)(int*, int*);
 
 class Engine {
 public:
+    // ---------------------------------------------------------------------
+    // The engine is PROCESS-WIDE, not per filter instance.
+    //
+    // NGX can only be initialised once per process, and the host keeps that
+    // latch inside its own DLL image (the static bool ngxInited in
+    // dlssnr_host2.cpp). A player builds a NEW filter instance for every file
+    // it opens, so the old per-instance engine meant: open another file ->
+    // instance destroyed -> FreeLibrary(host) -> latch lost ->
+    // NVSDK_NGX_D3D12_Init_Ext called a second time in the same process -> NGX
+    // answers 0xBAD00002 (FAIL_PlatformError) -> 3 failed attempts -> permanent
+    // passthrough until the player itself was restarted. One engine per process
+    // is the only arrangement that matches NGX's lifetime rules.
+    //
+    // A resolution change still works: that path calls dlssnr2_init() again,
+    // which reuses the D3D12 device and only rebuilds the feature + slots (the
+    // contract documented by dlssnr2_shutdown / docs/ENGINE_INTERFACE.md).
+    //
+    // Deliberately leaked: it owns a worker thread whose code lives in this DLL,
+    // so running its destructor while the module is being unloaded would execute
+    // code in a module that is going away.
+    static Engine& Instance() {
+        static Engine* inst = CreatePinned();
+        return *inst;
+    }
     Engine() : m_dll(nullptr), m_fnInit(nullptr), m_fnProcess(nullptr),
                m_fnSetOptions(nullptr), m_ready(false), m_failed(false),
                m_w(0), m_h(0), m_thread(nullptr), m_wantW(0), m_wantH(0),
@@ -374,10 +404,26 @@ public:
         if (m_evtWake) SetEvent(m_evtWake);
         if (m_thread) { WaitForSingleObject(m_thread, 30000); CloseHandle(m_thread); }
         if (m_evtWake) CloseHandle(m_evtWake);
-        // The host deliberately never tears down NGX (re-init in-process is
-        // unsafe), so we just drop our reference and let process exit reclaim it.
-        if (m_dll) FreeLibrary(m_dll);
+        // Deliberately NOT FreeLibrary(m_dll): unloading the host would discard
+        // its "NGX already inited" latch, and the next dlssnr2_init() would call
+        // Init_Ext a second time and fail with 0xBAD00002 -- the exact bug the
+        // process-wide Engine::Instance() above exists to prevent. Process exit
+        // reclaims it, so m_dll simply stays loaded.
         DeleteCriticalSection(&m_lock);
+    }
+
+    // Called when a new filter instance starts (the player opened another file).
+    // This engine now lives for the whole process, so the give-up latches from
+    // the previous file must be cleared here; otherwise a single transient
+    // failure would disable DLSSNR for every later file in the same process.
+    void NewSession() {
+        EnterCriticalSection(&m_lock);
+        m_gaveUp = false;
+        m_tries = 0;
+        m_tryW = m_tryH = 0;
+        m_loadFailed = false;
+        m_failed = false;
+        LeaveCriticalSection(&m_lock);
     }
 
     // Kick off (or re-target) a background init. Never blocks the caller.
@@ -398,6 +444,26 @@ public:
     int  Height()     { return m_h; }
     bool GaveUp()     { return m_gaveUp; }
     float LastProcessMs() { return (float)m_lastProcessMs; }
+
+    // Current requested options -- read by the settings window and the tray
+    // menu so they open showing the live state rather than the ini defaults.
+    bool  OptEnabled()   { return m_optEnabled; }
+    bool  OptSeeded()    { return m_seeded; }
+
+    // The ini is only the STARTING point. Because this engine lives for the
+    // whole process, re-reading the ini on every new filter instance would
+    // revert a change the user just made in the control panel, so seed once.
+    void SeedOptionsOnce(bool enabled, int style, float intensity, float tone, float strct) {
+        EnterCriticalSection(&m_lock);
+        bool first = !m_seeded;
+        m_seeded = true;
+        LeaveCriticalSection(&m_lock);
+        if (first) SetOptions(enabled, style, intensity, tone, strct);
+    }
+    int   OptStyle()     { return m_optStyle; }
+    float OptIntensity() { return m_optIntensity; }
+    float OptTone()      { return m_optTone; }
+    float OptStruct()    { return m_optStrct; }
 
     // Apply engine options. Safe to call when not initialised yet: the values
     // are cached in m_cfg and pushed again by DoInit(), so a panel change made
@@ -441,6 +507,18 @@ public:
 private:
     static DWORD WINAPI ThreadProc(LPVOID self) { ((Engine*)self)->Run(); return 0; }
 
+    // Pin this DLL for the rest of the process before creating the singleton.
+    // The engine outlives every filter instance and owns a thread that runs
+    // inside this module, so the module must never be unloaded while it lives.
+    static Engine* CreatePinned() {
+        HMODULE self = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN |
+                           GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                           (LPCWSTR)&Engine::CreatePinned, &self);
+        return new Engine();
+    }
+
+
     void Run() {
         for (;;) {
             if (m_quit) return;
@@ -455,16 +533,15 @@ private:
                 if (m_loadFailed) { WaitForSingleObject(m_evtWake, 1000); continue; }
                 // A failed init must NOT be retried in a hot loop: the old code
                 // spun here thousands of times a second, pegging a core and
-                // flooding the log (NGX cannot be re-inited with a new size in
-                // the same process, so the retry could never succeed anyway).
-                // After kMaxTries attempts for one geometry, give up until the
-                // geometry actually changes.
+                // flooding the log. After kMaxTries attempts for one geometry,
+                // stop until the geometry changes or another file is opened
+                // (Engine::NewSession clears the latch).
                 if (m_tryW == w && m_tryH == h && m_tries >= kMaxTries) {
                     if (!m_gaveUp) {
                         m_gaveUp = true;
                         LogRaw("engine: giving up on %dx%d after %d attempts "
-                               "(NGX allows one size per process; restart the player "
-                               "with this resolution to use DLSSNR)",
+                               "(engine init keeps failing - DLSSNR stays in "
+                               "passthrough; see the host engine log lines above)",
                                w, h, m_tries);
                     }
                     WaitForSingleObject(m_evtWake, 500);
@@ -524,68 +601,8 @@ private:
             return;   // keep thread alive; a later type change may succeed
         }
         LogRaw("engine: READY %dx%d", m_w, m_h);
-
-        // The engine is now genuinely running, so the picture on screen is being
-        // processed. That is the natural moment to surface the control panel:
-        // before this point there is nothing meaningful to tune.
-        LaunchPanelOnce();
-    }
-
-    // Start the Python control panel, once per process.
-    //
-    // Why a separate process rather than a property page or a tray icon inside
-    // this DLL: the panel is ~340 lines of shared-memory protocol, live slider
-    // write-back and status translation that already works. Reimplementing it as
-    // C++ (ISpecifyPropertyPages / Shell_NotifyIcon) would mean rewriting all of
-    // it for no functional gain. Launching the existing script reuses it exactly.
-    //
-    // It is deliberately best-effort: if Python is missing, or the script is not
-    // there, playback must be completely unaffected.
-    void LaunchPanelOnce() {
-        if (m_panelTried) return;
-        m_panelTried = true;
-
-        // Opt-in through the ini: a player filter must never spawn windows the
-        // user did not ask for.
-        wchar_t ini[MAX_PATH];
-        _snwprintf_s(ini, _countof(ini), _TRUNCATE, L"%s\\%s", g_dir, kIniName);
-        if (GetFileAttributesW(ini) != INVALID_FILE_ATTRIBUTES) {
-            if (GetPrivateProfileIntW(L"DLSSNR", L"panel", 0, ini) == 0) {
-                LogRaw("panel: not launching (panel=0 in the ini)");
-                return;
-            }
-        } else {
-            LogRaw("panel: not launching (no ini, so panel defaults to off)");
-            return;
-        }
-
-        wchar_t script[MAX_PATH];
-        _snwprintf_s(script, _countof(script), _TRUNCATE, L"%s\\dlssnr_panel.py", g_dir);
-        if (GetFileAttributesW(script) == INVALID_FILE_ATTRIBUTES) {
-            LogRaw("panel: dlssnr_panel.py not found next to the filter");
-            return;
-        }
-
-        // Prefer pythonw.exe: no console window flashing up behind the player.
-        // --auto tells the panel it was launched by the filter, so it starts
-        // hidden and reveals itself only once a live filter is detected.
-        wchar_t exe[MAX_PATH] = L"pythonw.exe";
-        wchar_t cmd[MAX_PATH * 2];
-        _snwprintf_s(cmd, _countof(cmd), _TRUNCATE, L"\"%s\" \"%s\" --auto", exe, script);
-
-        STARTUPINFOW si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
-        PROCESS_INFORMATION pi; ZeroMemory(&pi, sizeof(pi));
-        if (CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE,
-                           CREATE_NO_WINDOW, nullptr, g_dir, &si, &pi)) {
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-            LogRaw("panel: launched dlssnr_panel.py");
-        } else {
-            // pythonw.exe may not be on PATH; the panel is optional, so this is
-            // informational only.
-            LogRaw("panel: could not launch (err=%lu) - start it manually if wanted",
-                   GetLastError());
-        }
+        // The UI is the tray icon, which owns its own thread and opens the
+        // native control panel; nothing to launch from here (and no Python).
     }
 
     bool Load() {
@@ -632,15 +649,19 @@ private:
     int  m_tryW = 0, m_tryH = 0, m_tries = 0;
     bool m_gaveUp = false;
     volatile bool m_loadFailed = false;
-    // Whether we have already tried to spawn the control panel (once per process).
-    bool m_panelTried = false;
     // engine options (kept here so a panel change before init still applies)
     bool  m_optEnabled = true;
+    bool  m_seeded     = false;
     int   m_optStyle = 0;
     float m_optIntensity = 1.0f, m_optTone = 1.0f, m_optStrct = 1.0f;
     volatile bool m_optDirty = false;
     volatile double m_lastProcessMs = 0.0;
 };
+
+// The native UI (tray icon + settings window) and the DirectShow property page.
+// Both are ours and are compiled into this same translation unit.
+#include "dlssnr_ui.h"
+#include "dlssnr_page.h"
 
 // ---------------------------------------------------------------------------
 // media-type helpers
@@ -1467,21 +1488,24 @@ private:
 // ---------------------------------------------------------------------------
 // the filter
 // ---------------------------------------------------------------------------
-class CDlssNrFilter : public IBaseFilter {
+class CDlssNrFilter : public IBaseFilter, public ISpecifyPropertyPages {
 public:
     CDlssNrFilter() : m_ref(1), m_state(State_Stopped), m_pGraph(nullptr), m_pClock(nullptr),
-                      m_needReset(true), m_scratchIn(nullptr), m_scratchOut(nullptr),
+                      m_engine(Engine::Instance()), m_needReset(true),
+                      m_scratchIn(nullptr), m_scratchOut(nullptr),
                       m_scratchCap(0), m_lastType{}, m_hasLastType(false) {
+        // A new instance means another file/graph: allow a fresh init attempt
+        // even if the previous file's engine gave up.
+        m_engine.NewSession();
         m_in  = new CInputPin(this);
         m_out = new COutputPin(this);
         m_cfg = ReadConfig();
-        // Adopt the panel's current values as the baseline so we don't apply a
-        // spurious change on the first frame, then publish our real state.
-        if (g_shared) {
-            m_lastSeq = g_shared->reqSeq;
-            m_engine.SetOptions(m_cfg.enabled, m_cfg.style, m_cfg.intensity,
-                                m_cfg.localTone, m_cfg.localStruct);
-        }
+        // The engine is process-wide, so it is seeded from the ini exactly once
+        // and afterwards its live options are authoritative -- that is what lets
+        // the control panel toggle the master switch mid-playback.
+        m_engine.SeedOptionsOnce(m_cfg.enabled, m_cfg.style, m_cfg.intensity,
+                                 m_cfg.localTone, m_cfg.localStruct);
+        if (g_shared) m_lastSeq = g_shared->reqSeq;
         LogRaw("filter: created; config enabled=%d style=%d intensity=%d%%",
                m_cfg.enabled ? 1 : 0, m_cfg.style, (int)(m_cfg.intensity * 100));
     }
@@ -1496,6 +1520,9 @@ public:
         FreeMediaType(m_lastType);
         free(m_scratchIn);
         free(m_scratchOut);
+        // Balance the reference taken in JoinFilterGraph; the graph does not
+        // always send JoinFilterGraph(null) before dropping the filter.
+        if (m_trayHooked) { m_trayHooked = false; DlssNrTray::Instance().FilterRemoved(); }
     }
 
     CInputPin*  Input()  { return m_in; }
@@ -1542,7 +1569,7 @@ public:
         s->videoW        = w;
         s->videoH        = h;
         s->inputBpp      = bpp;
-        s->enabled       = m_cfg.enabled ? 1 : 0;
+        s->enabled       = m_engine.OptEnabled() ? 1 : 0;
         s->lastProcessMs = m_engine.LastProcessMs();
         s->pid           = (long)GetCurrentProcessId();
         SetStatus(reasonOverride, "%s", m_statusText);
@@ -1557,6 +1584,10 @@ public:
         }
         if (riid == IID_IMediaFilter) { LogProbeOnce("Filter", riid, true); *ppv = static_cast<IMediaFilter*>(this); AddRef(); return S_OK; }
         if (riid == IID_IPersist)     { LogProbeOnce("Filter", riid, true); *ppv = static_cast<IPersist*>(this);    AddRef(); return S_OK; }
+        if (riid == IID_ISpecifyPropertyPages) {
+            LogProbeOnce("Filter", riid, true);
+            *ppv = static_cast<ISpecifyPropertyPages*>(this); AddRef(); return S_OK;
+        }
         LogProbeOnce("Filter", riid, false);
         *ppv = nullptr; return E_NOINTERFACE;
     }
@@ -1573,6 +1604,18 @@ public:
         return S_OK;
     }
 
+    // ---- ISpecifyPropertyPages ----
+    // Hands the player's property frame the CLSID of our settings page, which
+    // is what puts "DLSSNR" into Filters -> Properties (same mechanism LAV uses).
+    STDMETHODIMP GetPages(CAUUID* pPages) {
+        if (!pPages) return E_POINTER;
+        pPages->pElems = (GUID*)CoTaskMemAlloc(sizeof(GUID));
+        if (!pPages->pElems) { pPages->cElems = 0; return E_OUTOFMEMORY; }
+        pPages->cElems = 1;
+        pPages->pElems[0] = CLSID_DlssNrPage;
+        return S_OK;
+    }
+
     STDMETHODIMP Stop() {
         m_state = State_Stopped;
         m_needReset = true;
@@ -1586,7 +1629,9 @@ public:
         if (m_in) m_in->Geometry(&w, &h);
         LogRaw("filter: Pause (input %dx%d, in-conn=%d out-conn=%d)",
                w, h, m_in && m_in->Connected() ? 1 : 0, m_out && m_out->Connected() ? 1 : 0);
-        if (m_cfg.enabled && w > 0 && h > 0) {
+        // Warm the engine up even when disabled: the master switch is live now,
+        // and it can only be instant if the model is already loaded.
+        if (w > 0 && h > 0) {
             LogRaw("filter: Pause -> requesting engine init %dx%d", w, h);
             m_engine.RequestInit(w, h);
         }
@@ -1634,6 +1679,10 @@ public:
         // Logged because "is the filter actually IN a graph?" is the single most
         // useful fact when it is created but never receives frames.
         LogRaw("JoinFilterGraph(%p) %s", (void*)pGraph, pGraph ? "ADDED to a graph" : "REMOVED");
+        // The tray icon exists exactly while a DLSSNR filter is in a graph, so
+        // it appears with playback and disappears when the player lets go.
+        if (pGraph && !m_trayHooked)      { m_trayHooked = true;  DlssNrTray::Instance().FilterAdded(); }
+        else if (!pGraph && m_trayHooked) { m_trayHooked = false; DlssNrTray::Instance().FilterRemoved(); }
         if (m_pGraph) m_pGraph->Release();
         m_pGraph = pGraph;
         if (m_pGraph) m_pGraph->AddRef();
@@ -1696,14 +1745,16 @@ public:
         //     not round-trip bit-exactly; that is inherent to 4:2:0, not a bug.
         bool done = false;
         int reason = kReasonNone;
-        if (!m_cfg.enabled) {
+        // Master switch lives in the process-wide engine so the panel can flip
+        // it live; m_cfg.enabled is only the ini snapshot taken at creation.
+        if (!m_engine.OptEnabled()) {
             reason = kReasonDisabled;
-            NoteOnce(&m_whyDisabled, "config disabled (enabled=0, from the panel or the ini)");
+            NoteOnce(&m_whyDisabled, "disabled by the control panel or the ini");
             SetStatusLocal("disabled by config/panel");
         } else if (!m_engine.Ready()) {
             reason = m_engine.GaveUp() ? kReasonGiveUp : kReasonNotReady;
             NoteOnce(&m_whyNotReady, "engine not ready yet (loading, or init failed) - passing through");
-            SetStatusLocal(m_engine.GaveUp() ? "engine init FAILED (one size per process)"
+            SetStatusLocal(m_engine.GaveUp() ? "engine init FAILED (see dlssnr_dshow.log)"
                                              : "loading model...");
         } else if (m_engine.Width() != w || m_engine.Height() != h) {
             reason = kReasonSizeMismatch;
@@ -1866,7 +1917,9 @@ private:
     CInputPin*    m_in;
     COutputPin*   m_out;
     Config        m_cfg;
-    Engine        m_engine;
+    // Shared process-wide engine (see Engine::Instance). A reference, not a
+    // value: every filter instance must drive the SAME NGX session.
+    Engine&       m_engine;
     volatile bool m_needReset;
     BYTE*         m_scratchIn;
     BYTE*         m_scratchOut;
@@ -1875,6 +1928,7 @@ private:
     // keeps reporting a usable type while a player probes the graph.
     AM_MEDIA_TYPE m_lastType;
     bool          m_hasLastType = false;
+    bool          m_trayHooked  = false;
     // Silent pass-through is the worst failure mode: the user sees "no effect"
     // with no clue why. Log each distinct reason exactly once per session.
     bool          m_whyDisabled  = false;
@@ -1970,7 +2024,7 @@ STDMETHODIMP CDlssNrFilter::EnumPins(IEnumPins** ppEnum) {
 // ---------------------------------------------------------------------------
 class CClassFactory : public IClassFactory {
 public:
-    CClassFactory() : m_ref(1) {}
+    explicit CClassFactory(const CLSID& clsid) : m_ref(1), m_clsid(clsid) {}
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) {
         if (!ppv) return E_POINTER;
         if (riid == IID_IUnknown || riid == IID_IClassFactory) { *ppv = this; AddRef(); return S_OK; }
@@ -1985,7 +2039,16 @@ public:
     STDMETHODIMP CreateInstance(IUnknown* pUnkOuter, REFIID riid, void** ppv) {
         if (!ppv) return E_POINTER;
         if (pUnkOuter) return CLASS_E_NOAGGREGATION;
-        CDlssNrFilter* p = new CDlssNrFilter();
+        IUnknown* p = nullptr;
+        if (IsEqualCLSID(m_clsid, CLSID_DlssNrFilter)) {
+            // Cast through the concrete interface: the filter implements two
+            // IUnknown-derived interfaces, so an implicit conversion is ambiguous.
+            p = static_cast<IBaseFilter*>(new CDlssNrFilter());
+        } else if (IsEqualCLSID(m_clsid, CLSID_DlssNrPage)) {
+            p = static_cast<IPropertyPage*>(new CDlssNrPage());
+        } else {
+            return CLASS_E_CLASSNOTAVAILABLE;
+        }
         if (!p) return E_OUTOFMEMORY;
         HRESULT hr = p->QueryInterface(riid, ppv);
         p->Release();
@@ -1997,13 +2060,15 @@ public:
         return S_OK;
     }
 private:
-    LONG m_ref;
+    LONG  m_ref;
+    CLSID m_clsid;
 };
 
 STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, void** ppv) {
     if (!ppv) return E_POINTER;
-    if (!IsEqualCLSID(rclsid, CLSID_DlssNrFilter)) return CLASS_E_CLASSNOTAVAILABLE;
-    CClassFactory* p = new CClassFactory();
+    if (!IsEqualCLSID(rclsid, CLSID_DlssNrFilter) &&
+        !IsEqualCLSID(rclsid, CLSID_DlssNrPage)) return CLASS_E_CLASSNOTAVAILABLE;
+    CClassFactory* p = new CClassFactory(rclsid);
     if (!p) return E_OUTOFMEMORY;
     HRESULT hr = p->QueryInterface(riid, ppv);
     p->Release();
@@ -2017,9 +2082,9 @@ STDAPI DllCanUnloadNow() {
 // ---------------------------------------------------------------------------
 // registration
 // ---------------------------------------------------------------------------
-static HRESULT RegisterComServer(bool reg) {
+static HRESULT RegisterOneClsid(REFCLSID id, const wchar_t* desc, bool reg) {
     wchar_t clsid[64];
-    StringFromGUID2(CLSID_DlssNrFilter, clsid, _countof(clsid));
+    StringFromGUID2(id, clsid, _countof(clsid));
     wchar_t key[MAX_PATH];
     _snwprintf_s(key, _countof(key), _TRUNCATE, L"CLSID\\%s", clsid);
 
@@ -2030,8 +2095,8 @@ static HRESULT RegisterComServer(bool reg) {
     HKEY hk = nullptr;
     if (RegCreateKeyExW(HKEY_CLASSES_ROOT, key, 0, nullptr, 0, KEY_WRITE, nullptr, &hk, nullptr) != ERROR_SUCCESS)
         return E_FAIL;
-    RegSetValueExW(hk, nullptr, 0, REG_SZ, (const BYTE*)kFilterName,
-                   (DWORD)((wcslen(kFilterName) + 1) * sizeof(wchar_t)));
+    RegSetValueExW(hk, nullptr, 0, REG_SZ, (const BYTE*)desc,
+                   (DWORD)((wcslen(desc) + 1) * sizeof(wchar_t)));
     RegCloseKey(hk);
 
     _snwprintf_s(key, _countof(key), _TRUNCATE, L"CLSID\\%s\\InprocServer32", clsid);
@@ -2046,6 +2111,14 @@ static HRESULT RegisterComServer(bool reg) {
                    (DWORD)((wcslen(tm) + 1) * sizeof(wchar_t)));
     RegCloseKey(hk);
     return S_OK;
+}
+
+// Both COM objects must be registered: the filter itself, and the property page
+// (the player's property frame CoCreateInstance()s the page by CLSID).
+static HRESULT RegisterComServer(bool reg) {
+    HRESULT a = RegisterOneClsid(CLSID_DlssNrFilter, kFilterName, reg);
+    HRESULT b = RegisterOneClsid(CLSID_DlssNrPage, L"DLSS Neural Render Settings", reg);
+    return FAILED(a) ? a : b;
 }
 
 STDAPI DllRegisterServer() {
