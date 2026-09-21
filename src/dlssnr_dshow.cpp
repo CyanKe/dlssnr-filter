@@ -297,6 +297,96 @@ static void LogProbeOnce(const char* who, const GUID& iid, bool supported) {
     LogProbeOnce(w, iid, supported);
 }
 
+// ---------------------------------------------------------------------------
+// SHELVED PAUSED-REFRESH ATTEMPTS (see RefreshIfNeeded)
+
+//
+// The path a player's own frame-step key takes: the graph manager runs the graph,
+// WAITS for exactly one frame to be presented, then pauses again. That wait is the
+// part that matters -- an immediate Run/Pause transition can complete without the
+// source ever handing over a new frame, which is why it showed nothing.
+//
+// Field log (PotPlayer): CanStep 0x00000000, Step 0x00000000, and a frame arrives
+// while paused. The cost is that the video advances by exactly one frame.
+//
+// Declared locally (with its published IID) so the build needs no extra import
+// library.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Refresh hook
+//
+// The panel/tray applies a parameter change through DlssNrApply(), which then tells
+// every live filter instance that an edit happened. On the PLAYER's side this cannot
+// repaint a paused picture (every mechanism was measured; see RefreshIfNeeded()), but
+// it is exactly what the panel's own 对比 (compare) view needs: there the engine
+// re-runs the frame it kept and the panel repaints from a buffer, touching nothing of
+// the player's.
+//
+// The filter class is defined below the UI include, hence a plain callback registry
+// instead of a class reference.
+// ---------------------------------------------------------------------------
+typedef void (*DlssNrRefreshFn)(void*, bool committed);
+struct DlssNrRefreshSink {
+    DlssNrRefreshFn fn;
+    void*           ctx;
+};
+static DlssNrRefreshSink g_refreshSinks[8] = {};
+static CRITICAL_SECTION  g_refreshLock;
+
+// ---- comparison preview buffer (read by the panel's 对比 window) ----------
+//
+// Two packed BGR24, top-down images of the same frame: as the graph delivered it, and
+// as the engine renders it. DirectShow's RGB24 is already B,G,R in memory, so the
+// panel can hand the buffer straight to StretchDIBits. Guarded, because the filter
+// fills it on the player's streaming thread while the panel paints it.
+static CRITICAL_SECTION g_prevCs;
+static bool   g_prevOn = false;      // the compare window is open
+static int    g_prevW = 0, g_prevH = 0;
+static LONG   g_prevSeq = 0;         // bumped whenever the images change
+static size_t g_prevCap = 0;         // bytes per image
+static BYTE*  g_prevBuf = nullptr;   // [0,cap) original, [cap,2*cap) processed
+
+static bool     DlssNrPreviewWant()    { return g_prevOn; }
+static void     DlssNrPreviewSetWant(bool on) { g_prevOn = on; }
+static LONG     DlssNrPreviewSeq()     { return g_prevSeq; }
+static int      DlssNrPreviewW()       { return g_prevW; }
+static int      DlssNrPreviewH()       { return g_prevH; }
+static const BYTE* DlssNrPreviewOrig() { return g_prevBuf; }
+static const BYTE* DlssNrPreviewProc() { return g_prevBuf ? g_prevBuf + g_prevCap : nullptr; }
+static void     DlssNrPreviewLock()    { EnterCriticalSection(&g_prevCs); }
+static void     DlssNrPreviewUnlock()  { LeaveCriticalSection(&g_prevCs); }
+
+// Bumped by the filter after re-rendering the kept frame with new parameters.
+static void DlssNrPreviewTouch() { InterlockedIncrement(&g_prevSeq); }
+
+static void DlssNrAddRefreshSink(DlssNrRefreshFn fn, void* ctx) {
+    EnterCriticalSection(&g_refreshLock);
+    bool added = false;
+    for (DlssNrRefreshSink& s : g_refreshSinks) {
+        if (!s.fn) { s.fn = fn; s.ctx = ctx; added = true; break; }
+    }
+    LeaveCriticalSection(&g_refreshLock);
+    if (!added) LogRaw("refresh: sink table full, the panel cannot repaint paused frames");
+}
+
+static void DlssNrRemoveRefreshSink(DlssNrRefreshFn fn, void* ctx) {
+    EnterCriticalSection(&g_refreshLock);
+    for (DlssNrRefreshSink& s : g_refreshSinks) {
+        if (s.fn == fn && s.ctx == ctx) { s.fn = nullptr; s.ctx = nullptr; break; }
+    }
+    LeaveCriticalSection(&g_refreshLock);
+}
+
+// Called by the panel/tray the moment new live options were applied.
+static void DlssNrRefreshSinks(bool committed) {
+    DlssNrRefreshSink local[8];
+    int n = 0;
+    EnterCriticalSection(&g_refreshLock);
+    for (const DlssNrRefreshSink& s : g_refreshSinks) if (s.fn && n < 8) local[n++] = s;
+    LeaveCriticalSection(&g_refreshLock);
+    for (int i = 0; i < n; ++i) local[i].fn(local[i].ctx, committed);
+}
+
 static void InitModuleDir(HMODULE h) {
     g_hModule = h;
     GetModuleFileNameW(h, g_dir, _countof(g_dir));
@@ -304,6 +394,8 @@ static void InitModuleDir(HMODULE h) {
     if (slash) *slash = 0;
     InitializeCriticalSection(&g_logLock);
     g_logLockInit = true;
+    InitializeCriticalSection(&g_refreshLock);   // refresh sink registry
+    InitializeCriticalSection(&g_prevCs);        // comparison preview buffer
     // Attach AFTER the log lock exists: OpenShared() logs on failure.
     OpenShared();
 }
@@ -317,6 +409,9 @@ struct Config {
     float intensity;     // 0..1
     float localTone;     // 0..1
     float localStruct;   // 0..1
+    float skinStruct;    // 0..2, 0 = off (same range/default as Magpie's
+                         //   DLSSNR "Skin Structure Strength")
+    bool  autoMask;      // DLSSNR.UseAutoMask
 };
 
 static Config ReadConfig() {
@@ -326,6 +421,8 @@ static Config ReadConfig() {
     c.intensity   = 1.0f;
     c.localTone   = 1.0f;
     c.localStruct = 1.0f;
+    c.skinStruct  = 0.0f;
+    c.autoMask    = false;
 
     wchar_t ini[MAX_PATH];
     _snwprintf_s(ini, _countof(ini), _TRUNCATE, L"%s\\%s", g_dir, kIniName);
@@ -336,9 +433,16 @@ static Config ReadConfig() {
     int iInt      = GetPrivateProfileIntW(L"DLSSNR", L"intensity", 100, ini);
     int iTone     = GetPrivateProfileIntW(L"DLSSNR", L"localtone",  100, ini);
     int iStruct   = GetPrivateProfileIntW(L"DLSSNR", L"localstruct",100, ini);
+    int iSkin     = GetPrivateProfileIntW(L"DLSSNR", L"skinstructure", 0, ini);
+    // 100% = 1.0 is the "full strength" default everywhere, so old ini files keep
+    // their meaning. Only the parameters that were measured to keep responding
+    // above 1.0 accept up to 200% = 2.0: DLSSNR.Intensity saturates at 1.0
+    // (1.0 and 2.0 gave bit-identical frames), so it is capped at 100%.
     c.intensity   = (float)(iInt    < 0 ? 0 : (iInt    > 100 ? 100 : iInt))    / 100.0f;
-    c.localTone   = (float)(iTone   < 0 ? 0 : (iTone   > 100 ? 100 : iTone))   / 100.0f;
-    c.localStruct = (float)(iStruct < 0 ? 0 : (iStruct > 100 ? 100 : iStruct)) / 100.0f;
+    c.localTone   = (float)(iTone   < 0 ? 0 : (iTone   > 200 ? 200 : iTone))   / 100.0f;
+    c.localStruct = (float)(iStruct < 0 ? 0 : (iStruct > 200 ? 200 : iStruct)) / 100.0f;
+    c.skinStruct  = (float)(iSkin   < 0 ? 0 : (iSkin   > 200 ? 200 : iSkin))   / 100.0f;
+    c.autoMask    = GetPrivateProfileIntW(L"DLSSNR", L"automask", 0, ini) != 0;
     return c;
 }
 
@@ -354,6 +458,15 @@ static float Clamp01(float v) {
     if (!(v == v)) return 1.0f;          // NaN guard: a bad panel write must not
     if (v < 0.0f) return 0.0f;           // poison the engine parameters
     if (v > 1.0f) return 1.0f;
+    return v;
+}
+
+// Same guard for the parameter whose range is not 0..1 (skin structure is
+// 0..2, matching Magpie's DLSSNR default of 0 = off).
+static float ClampRange(float v, float lo, float hi, float fallback) {
+    if (!(v == v)) return fallback;
+    if (v < lo) return lo;
+    if (v > hi) return hi;
     return v;
 }
 
@@ -394,10 +507,14 @@ public:
     }
     Engine() : m_dll(nullptr), m_fnInit(nullptr), m_fnProcess(nullptr),
                m_fnSetOptions(nullptr), m_ready(false), m_failed(false),
-               m_w(0), m_h(0), m_thread(nullptr), m_wantW(0), m_wantH(0),
+               m_w(0), m_h(0), m_thread(nullptr),
                m_evtWake(nullptr), m_quit(false) {
         InitializeCriticalSection(&m_lock);
         m_evtWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        // The worker lives for the whole process, so RequestInit() never has to
+        // create a thread (or take m_lock) while a graph thread waits on it.
+        m_thread = CreateThread(nullptr, 0, &Engine::ThreadProc, this, 0, nullptr);
+        if (!m_thread) LogRaw("engine: CreateThread failed");
     }
     ~Engine() {
         m_quit = true;
@@ -416,25 +533,35 @@ public:
     // This engine now lives for the whole process, so the give-up latches from
     // the previous file must be cleared here; otherwise a single transient
     // failure would disable DLSSNR for every later file in the same process.
+    //
+    // MUST NOT block: a player thread calls this while building a graph, and the
+    // engine thread can hold m_lock across a 1-15 s model load. If the lock is
+    // busy the request is recorded and the worker applies it on its next lap.
     void NewSession() {
-        EnterCriticalSection(&m_lock);
+        InterlockedExchange(&m_sessionReset, 1);
+        if (TryEnterCriticalSection(&m_lock)) {
+            ApplySessionReset();
+            LeaveCriticalSection(&m_lock);
+        }
+    }
+
+    // Clears the per-file latches. Call with m_lock held.
+    void ApplySessionReset() {
         m_gaveUp = false;
         m_tries = 0;
         m_tryW = m_tryH = 0;
         m_loadFailed = false;
         m_failed = false;
-        LeaveCriticalSection(&m_lock);
     }
 
-    // Kick off (or re-target) a background init. Never blocks the caller.
+    // Kick off (or re-target) a background init. MUST NOT block: this is called
+    // from the player's graph thread (IMediaFilter::Pause during a seek), and
+    // the engine thread holds m_lock across the whole dlssnr2_init() -- the
+    // 1-15 s model load. Taking m_lock here froze PotPlayer for the length of
+    // that load, which the user sees as "not responding" while seeking.
     void RequestInit(int w, int h) {
-        EnterCriticalSection(&m_lock);
-        m_wantW = w; m_wantH = h;
-        if (!m_thread) {
-            m_thread = CreateThread(nullptr, 0, &Engine::ThreadProc, this, 0, nullptr);
-            if (!m_thread) LogRaw("engine: CreateThread failed");
-        }
-        LeaveCriticalSection(&m_lock);
+        InterlockedExchange(&m_wantW, (LONG)w);
+        InterlockedExchange(&m_wantH, (LONG)h);
         if (m_evtWake) SetEvent(m_evtWake);
     }
 
@@ -444,6 +571,10 @@ public:
     int  Height()     { return m_h; }
     bool GaveUp()     { return m_gaveUp; }
     float LastProcessMs() { return (float)m_lastProcessMs; }
+    // Bumped on every live option change. The filter polls this so a panel edit
+    // made while the graph is paused (no frames flowing) can still be applied to
+    // the cached frame and re-delivered.
+    LONG ParameterRevision() { return m_paramRev; }
 
     // Current requested options -- read by the settings window and the tray
     // menu so they open showing the live state rather than the ini defaults.
@@ -453,28 +584,38 @@ public:
     // The ini is only the STARTING point. Because this engine lives for the
     // whole process, re-reading the ini on every new filter instance would
     // revert a change the user just made in the control panel, so seed once.
-    void SeedOptionsOnce(bool enabled, int style, float intensity, float tone, float strct) {
+    void SeedOptionsOnce(bool enabled, int style, float intensity, float tone,
+                         float strct, float skin, bool autoMask) {
         EnterCriticalSection(&m_lock);
         bool first = !m_seeded;
         m_seeded = true;
         LeaveCriticalSection(&m_lock);
-        if (first) SetOptions(enabled, style, intensity, tone, strct);
+        if (first) SetOptions(enabled, style, intensity, tone, strct, skin, autoMask);
     }
     int   OptStyle()     { return m_optStyle; }
     float OptIntensity() { return m_optIntensity; }
     float OptTone()      { return m_optTone; }
     float OptStruct()    { return m_optStrct; }
+    float OptSkin()      { return m_optSkin; }
+    bool  OptAutoMask()  { return m_optAutoMask; }
 
     // Apply engine options. Safe to call when not initialised yet: the values
     // are cached in m_cfg and pushed again by DoInit(), so a panel change made
     // before the model loads still takes effect.
-    void SetOptions(bool enabled, int style, float intensity, float tone, float strct) {
+    void SetOptions(bool enabled, int style, float intensity, float tone,
+                    float strct, float skin, bool autoMask) {
         m_optEnabled = enabled; m_optStyle = style; m_optIntensity = intensity;
         m_optTone = tone; m_optStrct = strct;
+        // Defensive: a stale ini or a hand-edited config must not push an
+        // out-of-range value into the NGX parameter block.
+        m_optSkin = ClampRange(skin, 0.0f, 2.0f, 0.0f);
+        m_optAutoMask = autoMask;
+        InterlockedIncrement(&m_paramRev);
         m_optDirty = true;
         if (m_ready && m_fnSetOptions) {
             EnterCriticalSection(&m_lock);
-            m_fnSetOptions(m_optStyle, m_optIntensity, m_optTone, m_optStrct, -1.0f, 0, 0);
+            m_fnSetOptions(m_optStyle, m_optIntensity, m_optTone, m_optStrct,
+                           m_optSkin, m_optAutoMask ? 1 : 0, 0);
             LeaveCriticalSection(&m_lock);
             m_optDirty = false;
         }
@@ -524,7 +665,8 @@ private:
             if (m_quit) return;
             int w, h;
             EnterCriticalSection(&m_lock);
-            w = m_wantW; h = m_wantH;
+            if (InterlockedExchange(&m_sessionReset, 0)) ApplySessionReset();
+            w = (int)m_wantW; h = (int)m_wantH;
             bool needInit = (w > 0 && h > 0) && !(m_ready && m_w == w && m_h == h);
             LeaveCriticalSection(&m_lock);
 
@@ -580,12 +722,15 @@ private:
         // model was still loading, that choice must survive the init rather than
         // being overwritten by the INI values read at construction time.
         if (m_optDirty) {
-            m_fnSetOptions(m_optStyle, m_optIntensity, m_optTone, m_optStrct, -1.0f, 0, 0);
+            m_fnSetOptions(m_optStyle, m_optIntensity, m_optTone, m_optStrct,
+                           m_optSkin, m_optAutoMask ? 1 : 0, 0);
         } else {
             m_optStyle = cfg.style; m_optIntensity = cfg.intensity;
             m_optTone = cfg.localTone; m_optStrct = cfg.localStruct;
+            m_optSkin = cfg.skinStruct; m_optAutoMask = cfg.autoMask;
             m_optEnabled = cfg.enabled;
-            m_fnSetOptions(cfg.style, cfg.intensity, cfg.localTone, cfg.localStruct, -1.0f, 0, 0);
+            m_fnSetOptions(cfg.style, cfg.intensity, cfg.localTone, cfg.localStruct,
+                           cfg.skinStruct, cfg.autoMask ? 1 : 0, 0);
         }
         m_optDirty = false;
         int ok = m_fnInit(w, h, log);
@@ -640,7 +785,9 @@ private:
     volatile bool m_failed;
     int          m_w, m_h;
     HANDLE       m_thread;
-    int          m_wantW, m_wantH;
+    // Requested geometry. Written from graph threads with InterlockedExchange
+    // (never under m_lock) and read by the worker; aligned 32-bit accesses.
+    volatile LONG m_wantW = 0, m_wantH = 0;
     HANDLE       m_evtWake;
     volatile bool m_quit;
     CRITICAL_SECTION m_lock;
@@ -649,13 +796,19 @@ private:
     int  m_tryW = 0, m_tryH = 0, m_tries = 0;
     bool m_gaveUp = false;
     volatile bool m_loadFailed = false;
+    // Set by NewSession() (a player thread) and consumed by the worker, which
+    // owns the actual bookkeeping fields.
+    volatile LONG m_sessionReset = 0;
     // engine options (kept here so a panel change before init still applies)
     bool  m_optEnabled = true;
     bool  m_seeded     = false;
     int   m_optStyle = 0;
     float m_optIntensity = 1.0f, m_optTone = 1.0f, m_optStrct = 1.0f;
+    float m_optSkin = 0.0f;              // 0..2 (0 = off)
+    bool  m_optAutoMask = false;
     volatile bool m_optDirty = false;
     volatile double m_lastProcessMs = 0.0;
+    volatile LONG m_paramRev = 0;
 };
 
 // The native UI (tray icon + settings window) and the DirectShow property page.
@@ -770,6 +923,54 @@ static void Nv12ToBgr24(const BYTE* src, int w, int h, int strideY, int strideUV
 // Converts packed BGR24 back to NV12. Chroma is averaged over each 2x2 block,
 // which is the correct inverse of the replication used above (picking one pixel
 // instead would bias chroma toward whichever sample DLSSNR happened to move).
+// Copies one frame (whatever the graph's pixel format is) into packed top-down
+// BGR24, which is exactly what the panel needs for StretchDIBits.
+static void DlssNrToBgr24(const BYTE* src, int w, int h, int bpp, bool isYuv,
+                          int stride, BYTE* dst) {
+    const int packed = w * 3;
+    if (isYuv) { Nv12ToBgr24(src, w, h, stride, stride, dst); return; }
+    if (bpp == 3) {
+        if (stride == packed) {
+            memcpy(dst, src, (size_t)packed * h);
+        } else {
+            for (int y = 0; y < h; ++y)
+                memcpy(dst + (size_t)y * packed, src + (size_t)y * stride, packed);
+        }
+        return;
+    }
+    for (int y = 0; y < h; ++y) {                 // RGB32: drop the unused byte
+        const BYTE* s = src + (size_t)y * stride;
+        BYTE* d = dst + (size_t)y * packed;
+        for (int x = 0; x < w; ++x) {
+            d[x * 3 + 0] = s[x * 4 + 0];
+            d[x * 3 + 1] = s[x * 4 + 1];
+            d[x * 3 + 2] = s[x * 4 + 2];
+        }
+    }
+}
+
+// Mirrors the frame the filter just processed into the preview buffer: original on
+// the left half of the buffer, engine output on the right. Called from the streaming
+// path, so it only runs while the compare window is open.
+static void DlssNrPreviewFrame(const BYTE* pOrig, const BYTE* pProc, int w, int h,
+                               int bpp, bool isYuv, int stride) {
+    if (!g_prevOn || w <= 0 || h <= 0 || !pOrig || !pProc) return;
+    const size_t need = (size_t)w * 3 * h;
+    EnterCriticalSection(&g_prevCs);
+    if (g_prevCap < need) {
+        BYTE* nb = (BYTE*)realloc(g_prevBuf, need * 2);
+        if (!nb) { LeaveCriticalSection(&g_prevCs); return; }
+        g_prevBuf = nb;
+        g_prevCap = need;
+    }
+    DlssNrToBgr24(pOrig, w, h, bpp, isYuv, stride, g_prevBuf);
+    DlssNrToBgr24(pProc, w, h, bpp, isYuv, stride, g_prevBuf + need);
+    g_prevW = w;
+    g_prevH = h;
+    LeaveCriticalSection(&g_prevCs);
+    DlssNrPreviewTouch();
+}
+
 static void Bgr24ToNv12(const BYTE* src, int w, int h, int strideY, int strideUV,
                         BYTE* dst) {
     for (int y = 0; y < h; ++y) {
@@ -1145,7 +1346,9 @@ public:
     STDMETHODIMP EndOfStream() { return OnEndOfStream(); }
     STDMETHODIMP BeginFlush()  { return OnBeginFlush(); }
     STDMETHODIMP EndFlush()    { return OnEndFlush(); }
-    STDMETHODIMP NewSegment(REFERENCE_TIME, REFERENCE_TIME, double) { return S_OK; }
+    STDMETHODIMP NewSegment(REFERENCE_TIME tStart, REFERENCE_TIME tStop, double rate) {
+        return OnNewSegment(tStart, tStop, rate);
+    }
 
     // hooks
     virtual void    OnConnected() {}
@@ -1153,6 +1356,7 @@ public:
     virtual HRESULT OnEndOfStream() { return S_OK; }
     virtual HRESULT OnBeginFlush()  { return S_OK; }
     virtual HRESULT OnEndFlush()    { return S_OK; }
+    virtual HRESULT OnNewSegment(REFERENCE_TIME, REFERENCE_TIME, double) { return S_OK; }
 
     // The negotiated type, or null if none. VIRTUAL because the output pin of a
     // transform filter must never hold a stale copy: its type is by definition
@@ -1263,6 +1467,8 @@ public:
     void    OnConnected() override;
     void    OnDisconnected() override;
     HRESULT OnBeginFlush() override;
+    HRESULT OnEndFlush() override;
+    HRESULT OnNewSegment(REFERENCE_TIME, REFERENCE_TIME, double) override;
 
 private:
     CInputMemInputPin m_memIn;
@@ -1395,6 +1601,11 @@ public:
     }
     STDMETHODIMP BeginFlush() { return m_pConnected ? m_pConnected->BeginFlush() : S_OK; }
     STDMETHODIMP EndFlush()   { return m_pConnected ? m_pConnected->EndFlush()   : S_OK; }
+    // A transform filter has to pass the segment through; before this the
+    // renderer never saw one at all.
+    STDMETHODIMP NewSegment(REFERENCE_TIME tStart, REFERENCE_TIME tStop, double rate) {
+        return m_pConnected ? m_pConnected->NewSegment(tStart, tStop, rate) : S_OK;
+    }
 
     IMemAllocator* Allocator() { return m_pAlloc; }
 
@@ -1497,6 +1708,12 @@ public:
         // A new instance means another file/graph: allow a fresh init attempt
         // even if the previous file's engine gave up.
         m_engine.NewSession();
+        InitializeCriticalSection(&m_streamCs);
+        m_streamCsInit = true;
+        // The panel pushes a refresh here the moment a parameter is applied, so
+        // there is no polling at all: a paused graph has no frames and an edit
+        // made while paused is the only thing that needs to repaint the picture.
+        DlssNrAddRefreshSink(&CDlssNrFilter::RefreshThunk, this);
         m_in  = new CInputPin(this);
         m_out = new COutputPin(this);
         m_cfg = ReadConfig();
@@ -1504,12 +1721,20 @@ public:
         // and afterwards its live options are authoritative -- that is what lets
         // the control panel toggle the master switch mid-playback.
         m_engine.SeedOptionsOnce(m_cfg.enabled, m_cfg.style, m_cfg.intensity,
-                                 m_cfg.localTone, m_cfg.localStruct);
+                                 m_cfg.localTone, m_cfg.localStruct,
+                                 m_cfg.skinStruct, m_cfg.autoMask);
         if (g_shared) m_lastSeq = g_shared->reqSeq;
-        LogRaw("filter: created; config enabled=%d style=%d intensity=%d%%",
-               m_cfg.enabled ? 1 : 0, m_cfg.style, (int)(m_cfg.intensity * 100));
+        LogRaw("filter: created; config enabled=%d style=%d intensity=%d%% "
+               "skinstructure=%d%% automask=%d",
+               m_cfg.enabled ? 1 : 0, m_cfg.style, (int)(m_cfg.intensity * 100),
+               (int)(m_cfg.skinStruct * 100), m_cfg.autoMask ? 1 : 0);
     }
     virtual ~CDlssNrFilter() {
+        // Unregister first: the panel thread walks this list, so it must not see
+        // an object that is being torn down.
+        m_shutdown = true;
+        DlssNrRemoveRefreshSink(&CDlssNrFilter::RefreshThunk, this);
+        if (m_streamCsInit) { DeleteCriticalSection(&m_streamCs); m_streamCsInit = false; }
         // Orphan the pins FIRST: they are refcounted and may outlive us (the
         // graph can still call into them during teardown), so their raw
         // back-pointer must not dangle.
@@ -1544,14 +1769,20 @@ public:
         m_cfg.intensity   = Clamp01(s->reqIntensity);
         m_cfg.localTone   = Clamp01(s->reqLocalTone);
         m_cfg.localStruct = Clamp01(s->reqLocalStruct);
+        // skinStruct / autoMask have no legacy request field: the request path
+        // predates them and the in-process panel drives Engine::SetOptions()
+        // directly, so keep the ini/current values here.
         // Push to the engine now (no-op if it is not ready; DoInit() re-applies
         // the cached values when the model finishes loading).
         m_engine.SetOptions(m_cfg.enabled, m_cfg.style, m_cfg.intensity,
-                            m_cfg.localTone, m_cfg.localStruct);
-        LogRaw("panel: enabled=%d style=%d intensity=%d%% tone=%d%% struct=%d%%",
+                            m_cfg.localTone, m_cfg.localStruct,
+                            m_cfg.skinStruct, m_cfg.autoMask);
+        LogRaw("panel: enabled=%d style=%d intensity=%d%% tone=%d%% struct=%d%% "
+               "skin=%d%% automask=%d",
                m_cfg.enabled ? 1 : 0, m_cfg.style,
                (int)(m_cfg.intensity * 100), (int)(m_cfg.localTone * 100),
-               (int)(m_cfg.localStruct * 100));
+               (int)(m_cfg.localStruct * 100), (int)(m_cfg.skinStruct * 100),
+               m_cfg.autoMask ? 1 : 0);
         s->reqApplied = seq;
     }
 
@@ -1618,11 +1849,17 @@ public:
 
     STDMETHODIMP Stop() {
         m_state = State_Stopped;
+        // A seek/stop makes every queued sample worthless, and the renderer must
+        // stop expecting one. Without the flush markers the graph could wait for
+        // a delivery that will never be useful -- the seek hang.
+        m_flushing = true;
         m_needReset = true;
+        LogRaw("filter: Stop -> stopped (frames while paused: %d)", m_framesWhilePaused);
         return S_OK;
     }
     STDMETHODIMP Pause() {
         m_state = State_Paused;
+        m_flushing = false;                 // EndFlush may never arrive
         // Now that a format is locked in, warm the engine up. Async: the graph
         // keeps running and frames pass through until the model is loaded.
         int w = 0, h = 0;
@@ -1630,8 +1867,11 @@ public:
         LogRaw("filter: Pause (input %dx%d, in-conn=%d out-conn=%d)",
                w, h, m_in && m_in->Connected() ? 1 : 0, m_out && m_out->Connected() ? 1 : 0);
         // Warm the engine up even when disabled: the master switch is live now,
-        // and it can only be instant if the model is already loaded.
-        if (w > 0 && h > 0) {
+        // and it can only be instant if the model is already loaded. Skip the
+        // request when the session already matches -- a seek pings Pause a lot
+        // and there is no reason to touch the engine on each one.
+        if (w > 0 && h > 0 && !(m_engine.Ready() &&
+                                m_engine.Width() == w && m_engine.Height() == h)) {
             LogRaw("filter: Pause -> requesting engine init %dx%d", w, h);
             m_engine.RequestInit(w, h);
         }
@@ -1639,7 +1879,11 @@ public:
     }
     STDMETHODIMP Run(REFERENCE_TIME) {
         m_state = State_Running;
+        m_flushing = false;
         m_needReset = true;
+        LogRaw("filter: Run -> running (paused-time frames seen: %d)", m_framesWhilePaused);
+        m_framesWhilePaused = 0;
+        m_droppedFlush = m_droppedStopped = 0;
         return S_OK;
     }
     STDMETHODIMP GetState(DWORD, FILTER_STATE* pState) {
@@ -1698,51 +1942,116 @@ public:
         return S_OK;
     }
 
-    // ---- streaming: the engine lives here ----
-    HRESULT DoReceive(IMediaSample* pIn) {
-        if (!pIn) return E_POINTER;
-        const AM_MEDIA_TYPE* mt = m_in->MediaType();
-        if (!mt) return VFW_E_NOT_CONNECTED;
+    // ---- the paused refresh: SHELVED ---------------------------------------
+    //
+    // A paused graph delivers no samples, so an edit made while paused has nothing to
+    // affect -- and the frozen frame belongs to the player, not to this filter. Every
+    // mechanism a filter can reach was tried and measured; see RefreshIfNeeded() for
+    // the list. None of them make a paused picture change, so nothing is attempted any
+    // more: a paused edit only updates the engine options, and the next frame that
+    // plays carries them.
 
-        int w = 0, h = 0;
-        m_in->Geometry(&w, &h);
-        if (w <= 0 || h <= 0) return E_UNEXPECTED;
-        const bool isYuv = IsYuvType(mt);
-        const int bpp    = BytesPerPixel(mt);
+    // Called by the panel/tray (any thread) right after a parameter changed.
+    static void RefreshThunk(void* ctx, bool committed) {
+        ((CDlssNrFilter*)ctx)->RequestRefresh(committed);
+    }
+
+    void RequestRefresh(bool) {
+        // The engine re-run costs 10-30 ms. Doing it on the caller's thread (which is
+        // the PANEL's own UI thread) is what made the sliders impossible to drag: the
+        // turn starts on a pool thread instead, and a second request while one is
+        // queued is simply dropped -- RefreshIfNeeded loops until the parameter
+        // revision it rendered matches the latest one.
+        if (m_shutdown) return;
+        if (m_rebuildQueued) return;
+        m_rebuildQueued = true;
+        if (!TrySubmitThreadpoolCallback(&CDlssNrFilter::PoolRebuild, this, nullptr)) {
+            m_rebuildQueued = false;
+            RefreshIfNeeded();
+        }
+    }
+
+    static VOID CALLBACK PoolRebuild(PTP_CALLBACK_INSTANCE, PVOID ctx) {
+        CDlssNrFilter* self = (CDlssNrFilter*)ctx;
+        self->m_rebuildQueued = false;
+        self->RefreshIfNeeded();
+    }
+
+    void RefreshIfNeeded() {
+        if (m_shutdown) return;
+        // The panel's 对比 view is the one place where a parameter change made while
+        // paused CAN be seen: the engine re-runs the frame the preview kept and the
+        // panel repaints from that buffer. Nothing here touches the player's graph.
+        // While playback is running the streaming path mirrors every frame anyway, so
+        // there is nothing to re-run (and doing it would just fight the live frames).
+        if (DlssNrPreviewWant() && m_state == State_Paused) {
+            // Loop until we have rendered the LATEST parameter revision: a slider drag
+            // bumps it faster than one engine run takes, and rendering a stale set and
+            // stopping is what made the right half flicker between two images.
+            for (int guard = 0; guard < 4; ++guard) {
+                const LONG rev = m_engine.ParameterRevision();
+                RebuildPreview();
+                if (m_engine.ParameterRevision() == rev) break;
+            }
+            return;
+        }
+        // SHELVED on the player's side: a parameter change made while the picture is
+        // frozen cannot be made visible there. Every path a filter can reach was
+        // measured:
+        //   * pushing a re-rendered sample -> the renderer queues it, never paints it,
+        //     and the queue flashes out on unpause;
+        //   * IMediaSeeking::SetPositions -> a paused parser returns the previous
+        //     keyframe, so the picture AND the position jump backwards;
+        //   * IMediaControl::Run() + immediate Pause() -> nothing changes at all;
+        //   * IVideoFrameStep::Step(1) -> S_OK and a frame really was delivered, but
+        //     PotPlayer does not repaint a paused picture even for its OWN "next
+        //     frame" command. That is what closed the case: the player owns the
+        //     frozen frame, so no filter-side mechanism can win.
+        // A paused edit therefore just updates the engine options; the next frame that
+        // plays carries the new parameters.
+        if (m_state == State_Paused && !m_loggedPausedEdit) {
+            m_loggedPausedEdit = true;
+            LogRaw("refresh: paused edits cannot repaint the player's picture (shelved) - "
+                   "use the panel's compare view, or resume playback");
+        }
+    }
+
+    // Re-renders the frame kept in the preview buffer with the current parameters and
+    // hands it back to the panel. This is what makes a paused edit visible at all.
+    void RebuildPreview() {
+        size_t need = 0;
+        // m_scratchIn/Out are shared with the streaming path, so the whole copy ->
+        // engine -> write-back runs under the stream lock. Without this the two paths
+        // trampled each other's buffers and the picture flickered.
+        EnterCriticalSection(&m_streamCs);
+        const int w = g_prevW;
+        const int h = g_prevH;
+        need = (size_t)(w > 0 ? w : 0) * 3 * (size_t)(h > 0 ? h : 0);
+        if (g_prevBuf && w > 0 && h > 0 && g_prevCap >= need) {
+            EnterCriticalSection(&g_prevCs);
+            memcpy(m_scratchIn, g_prevBuf, need);
+            LeaveCriticalSection(&g_prevCs);
+            if (EnsureScratch(need) && m_engine.Process(m_scratchIn, m_scratchOut, w, h, false)) {
+                EnterCriticalSection(&g_prevCs);
+                if (g_prevBuf && g_prevCap >= need) {
+                    memcpy(g_prevBuf + need, m_scratchOut, need);
+                    DlssNrPreviewTouch();
+                }
+                LeaveCriticalSection(&g_prevCs);
+            }
+        }
+        LeaveCriticalSection(&m_streamCs);
+    }
+
+    // Runs the engine (or the pure pass-through copy) for one frame. Shared by
+    // the streaming path and the paused-refresh path.
+    bool ProcessFrame(const BYTE* pSrc, BYTE* pDst, const AM_MEDIA_TYPE* mt,
+                      int w, int h, int bpp, bool isYuv, int* reasonOut) {
+        *reasonOut = kReasonNone;
         const int inStride  = StrideOf(w, isYuv ? 1 : bpp);
         const int outStride = inStride;
-        // YUV needs the luma plane padded the same way; the engine always speaks
-        // tightly packed BGR24, so BGR rows are never padded.
         const int packed = w * 3;
-
-        // Pick up panel changes BEFORE processing so they take effect on this
-        // very frame instead of the next one.
-        ApplyRequests();
-
-        BYTE* pSrc = nullptr;
-        if (FAILED(pIn->GetPointer(&pSrc)) || !pSrc) return E_UNEXPECTED;
-
-        // get an output sample from our allocator
-        if (!m_out->Allocator()) return VFW_E_NOT_CONNECTED;
-        IMediaSample* pOut = nullptr;
-        HRESULT hr = m_out->Allocator()->GetBuffer(&pOut, nullptr, nullptr, 0);
-        if (FAILED(hr) || !pOut) return hr;
-
-        BYTE* pDst = nullptr;
-        hr = pOut->GetPointer(&pDst);
-        if (FAILED(hr) || !pDst) { pOut->Release(); return hr; }
-
         const size_t need = (size_t)SampleSizeOf(mt, w, h);
-        if (pOut->GetSize() < (long)need) { pOut->Release(); return E_UNEXPECTED; }
-
-        // ---- run the engine, or pass through ----
-        // The engine only speaks tightly packed BGR24, so:
-        //   * RGB24 input is already in that layout -- pass the pointer straight
-        //     in when the stride happens to be packed (the common case), else
-        //     gather the rows first.
-        //   * NV12/YUV input is converted into the staging buffer, processed,
-        //     then converted back. Chroma is subsampled, so "processed" YUV does
-        //     not round-trip bit-exactly; that is inherent to 4:2:0, not a bug.
         bool done = false;
         int reason = kReasonNone;
         // Master switch lives in the process-wide engine so the panel can flip
@@ -1835,6 +2144,83 @@ public:
                     memcpy(pDst + (size_t)y * outStride, pSrc + (size_t)y * inStride, rowBytes);
             }
         }
+        *reasonOut = reason;
+        return done;
+    }
+
+    // ---- streaming: the engine lives here ----
+    HRESULT DoReceive(IMediaSample* pIn) {
+        if (!pIn) return E_POINTER;
+        // Flush / stop contract: while the graph is flushing (seek, stop, graph
+        // teardown) the correct answer is E_ABORT -- return immediately instead
+        // of blocking the source's streaming thread inside the engine. Without
+        // this, a seek waited for a full engine call and the player stalled.
+        // Diagnostic: does the graph keep pushing frames while the player says
+        // it is paused? That single fact decides how a live parameter change can
+        // be made visible on a frozen picture.
+        if (m_state != State_Running) {
+            if (m_framesWhilePaused == 0 || (m_framesWhilePaused % 30) == 0)
+                LogRaw("filter: frame %d arrived while state=%d (paused=%d)",
+                       m_framesWhilePaused + 1, (int)m_state, (int)State_Paused);
+            ++m_framesWhilePaused;
+        }
+        if (m_flushing) {
+            if (m_droppedFlush++ == 0) LogRaw("filter: dropping frames while flushing");
+            return E_ABORT;
+        }
+        if (m_state == State_Stopped) {
+            if (m_droppedStopped++ == 0) LogRaw("filter: dropping frames while stopped");
+            return S_FALSE;   // discard, do not process
+        }
+        const AM_MEDIA_TYPE* mt = m_in->MediaType();
+        if (!mt) return VFW_E_NOT_CONNECTED;
+
+        int w = 0, h = 0;
+        m_in->Geometry(&w, &h);
+        if (w <= 0 || h <= 0) return E_UNEXPECTED;
+        const bool isYuv = IsYuvType(mt);
+        const int bpp    = BytesPerPixel(mt);
+        const size_t need = (size_t)SampleSizeOf(mt, w, h);
+
+        // Pick up panel changes BEFORE processing so they take effect on this
+        // very frame instead of the next one.
+        ApplyRequests();
+
+        BYTE* pSrc = nullptr;
+        if (FAILED(pIn->GetPointer(&pSrc)) || !pSrc) return E_UNEXPECTED;
+
+        // A paused graph delivers nothing, so remember the timestamp of the frame on
+        // screen: a later parameter edit repositions the graph to it and runs it
+        // again, and the engine re-runs on the way through (see CueCurrentFrame).
+        // get an output sample from our allocator
+        if (!m_out->Allocator()) return VFW_E_NOT_CONNECTED;
+        IMediaSample* pOut = nullptr;
+        HRESULT hr = m_out->Allocator()->GetBuffer(&pOut, nullptr, nullptr, 0);
+        if (FAILED(hr) || !pOut) return hr;
+
+        BYTE* pDst = nullptr;
+        hr = pOut->GetPointer(&pDst);
+        if (FAILED(hr) || !pDst) { pOut->Release(); return hr; }
+
+        if (pOut->GetSize() < (long)need) { pOut->Release(); return E_UNEXPECTED; }
+
+        // ---- run the engine, or pass through ----
+        // The engine only speaks tightly packed BGR24, so:
+        //   * RGB24 input is already in that layout -- pass the pointer straight
+        //     in when the stride happens to be packed (the common case), else
+        //     gather the rows first.
+        //   * NV12/YUV input is converted into the staging buffer, processed,
+        //     then converted back. Chroma is subsampled, so "processed" YUV does
+        //     not round-trip bit-exactly; that is inherent to 4:2:0, not a bug.
+        int reason = kReasonNone;
+        bool done = false;
+        {
+            // Serialized against the paused-refresh path (shared scratch buffers
+            // and engine temporal history).
+            EnterCriticalSection(&m_streamCs);
+            done = ProcessFrame(pSrc, pDst, mt, w, h, bpp, isYuv, &reason);
+            LeaveCriticalSection(&m_streamCs);
+        }
 
         // ---- timestamps / flags ----
         REFERENCE_TIME tStart = 0, tStop = 0;
@@ -1845,8 +2231,16 @@ public:
         pOut->SetDiscontinuity(pIn->IsDiscontinuity() == S_OK);
         pOut->SetActualDataLength((long)need);
 
+        // Feed the panel's comparison preview while it is open (pure bookkeeping:
+        // nothing here touches the player's graph).
+        DlssNrPreviewFrame(pSrc, pDst, w, h, bpp, isYuv, StrideOf(w, isYuv ? 1 : bpp));
+
         IPin* pDown = m_out->Connected();
         if (!pDown) { pOut->Release(); return VFW_E_NOT_CONNECTED; }
+        // Re-check before delivering: a flush that started while the engine was
+        // running makes this sample worthless, and pushing it downstream would
+        // undo the renderer's flush.
+        if (m_flushing) { pOut->Release(); return E_ABORT; }
         IMemInputPin* pSink = nullptr;
         hr = pDown->QueryInterface(IID_IMemInputPin, (void**)&pSink);
         if (SUCCEEDED(hr) && pSink) hr = pSink->Receive(pOut);
@@ -1891,7 +2285,44 @@ public:
         // connect/probe/reconnect cycle.
         m_needReset = true;
     }
-    void OnInputFlush() { m_needReset = true; }
+    void OnInputFlush() {
+        // Forwarded from the upstream pin when the graph flushes (seek, stop).
+        m_flushing = true;
+        m_needReset = true;
+        m_droppedFlush = 0;
+        LogRaw("filter: BeginFlush (state=%d)", (int)m_state);
+        ForwardFlush(true);
+    }
+    // Remember the segment: the paused refresh replays it, which is the sequence
+    // a renderer accepts while paused (same as after a seek).
+    void OnInputNewSegment(REFERENCE_TIME tStart, REFERENCE_TIME tStop, double rate) {
+        m_segStart = tStart;
+        m_segStop = tStop;
+        m_segRate = rate;
+        m_segValid = true;
+        ForwardSegment(tStart, tStop, rate);
+    }
+
+    void ForwardSegment(REFERENCE_TIME tStart, REFERENCE_TIME tStop, double rate) {
+        if (!m_out) return;
+        m_out->NewSegment(tStart, tStop, rate);
+    }
+
+    void OnInputEndFlush() {
+        m_flushing = false;
+        m_needReset = true;
+        m_droppedStopped = 0;
+        LogRaw("filter: EndFlush (state=%d)", (int)m_state);
+        ForwardFlush(false);
+    }
+
+    // The renderer must see the same flush the source sent us, otherwise it
+    // keeps waiting for a sample that the flush is supposed to discard.
+    void ForwardFlush(bool begin) {
+        if (!m_out) return;
+        if (begin) m_out->BeginFlush();
+        else       m_out->EndFlush();
+    }
 
     // The last negotiated type, retained across input disconnects.
     const AM_MEDIA_TYPE* LastType() const { return m_hasLastType ? &m_lastType : nullptr; }
@@ -1921,6 +2352,27 @@ private:
     // value: every filter instance must drive the SAME NGX session.
     Engine&       m_engine;
     volatile bool m_needReset;
+    // Set from Stop()/BeginFlush() (graph threads) and cleared by Pause()/Run()/
+    // EndFlush(); DoReceive() checks it and answers E_ABORT while it is set.
+    volatile bool m_flushing = false;
+    // Diagnostics for "can a parameter change be seen while paused": how many
+    // frames the graph pushes while we are not running, and how many we drop.
+    volatile long m_framesWhilePaused = 0;
+    volatile long m_droppedFlush = 0;
+    volatile long m_droppedStopped = 0;
+
+    // ---- the paused refresh (see StepOneFrame) ----
+    volatile bool m_refreshQueued = false;
+    bool          m_loggedPausedEdit = false;   // one log line per session
+    volatile bool m_rebuildQueued = false;      // one preview re-run at a time
+    volatile bool m_shutdown = false;
+    // Last segment seen upstream; replayed before a paused refresh.
+    REFERENCE_TIME m_segStart = 0, m_segStop = 0;
+    double         m_segRate = 1.0;
+    bool           m_segValid = false;
+    // Serializes frame processing between the streaming path and the refresh.
+    CRITICAL_SECTION m_streamCs{};
+    bool          m_streamCsInit = false;
     BYTE*         m_scratchIn;
     BYTE*         m_scratchOut;
     size_t        m_scratchCap;
@@ -1953,6 +2405,11 @@ private:
 void CInputPin::OnConnected()     { if (m_pFilter) m_pFilter->OnInputConnected(); }
 HRESULT CInputPin::DoReceive(IMediaSample* p) { return m_pFilter ? m_pFilter->DoReceive(p) : E_UNEXPECTED; }
 HRESULT CInputPin::OnBeginFlush() { if (m_pFilter) m_pFilter->OnInputFlush(); return S_OK; }
+HRESULT CInputPin::OnEndFlush()   { if (m_pFilter) m_pFilter->OnInputEndFlush(); return S_OK; }
+HRESULT CInputPin::OnNewSegment(REFERENCE_TIME tStart, REFERENCE_TIME tStop, double rate) {
+    if (m_pFilter) m_pFilter->OnInputNewSegment(tStart, tStop, rate);
+    return S_OK;
+}
 void    CInputPin::OnDisconnected() {
     if (m_pFilter) m_pFilter->OnInputDisconnected();
     SetAllocator(nullptr);

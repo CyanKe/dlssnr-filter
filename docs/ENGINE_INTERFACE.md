@@ -60,6 +60,84 @@ filter's own directory.
 fractions. The DirectShow filter and the Python app agree on this; changing it
 on one side alone would scale the effect wrongly by 100×.
 
+**Exception, skin structure:** that parameter runs **0–200%**, mapping to the
+0.0–2.0 float the toolkit expects for `DLSSNR.SkinStructureStrength`, and its
+default is **0 = off** — the same range and default Magpie uses for the same
+NGX parameter. The filter's INI key is `skinstructure`.
+
+The filter forwards `skinStruct` and `autoMask` from its INI keys
+(`skinstructure`, `automask`); before those keys existed it passed the
+placeholder `-1.0f, 0` for them on every call. `uiCorrection` is still sent as
+`0` — the filter exposes no control for it yet.
+
+---
+
+## Streaming / flush contract (filter side)
+
+A seek makes PotPlayer re-`Pause()` the graph and can rebuild the filter. Two
+rules keep the player's own threads free while that happens; both were violated
+before, and the player froze ("not responding") on seek:
+
+1. **Never block a graph thread on the engine.** The engine thread holds its
+   critical section across `dlssnr2_init()` (the 1-15 s model load), so
+   `RequestInit()` (called from `IMediaFilter::Pause`) and `NewSession()`
+   (called from the filter constructor) only record the request:
+   `RequestInit` uses `InterlockedExchange` on the wanted geometry plus
+   `SetEvent`, and `NewSession` sets a reset flag that the worker applies on its
+   next lap when the lock is busy.
+2. **Honour the flush.** `Stop()` / `BeginFlush()` set a volatile `flushing`
+   flag; `DoReceive()` answers `E_ABORT` immediately while it is set (before
+   touching the sample, and again before pushing downstream) and never runs the
+   engine. `BeginFlush`/`EndFlush` are forwarded to the output pin so the
+   renderer performs its own flush. `Pause()`/`Run()`/`EndFlush()` clear the
+   flag, because a graph does not always send `EndFlush`.
+
+`dlssnr2_process` itself is still a synchronous call inside the host, so a GPU
+stall inside the host still blocks that one frame; the filter cannot interrupt a
+call that is already in flight.
+
+### Paused-frame refresh (filter only): SHELVED
+
+A paused graph delivers nothing (measured: `Pause`, then 6.6 s later
+`Stop -> stopped (frames while paused: 0)`), and the frozen picture belongs to the
+player's renderer, not to the filter. Every path a DirectShow transform filter can
+take was implemented and measured, and none of them makes a paused picture change:
+
+| Attempt | Measured outcome |
+| --- | --- |
+| Push a re-rendered sample at the renderer (`NewSegment` + preroll) | Accepted (`Receive 0x0`) but **queued**, never painted — the frozen picture stayed, and the whole queue flashed out on unpause as a burst of differently processed frames |
+| `IMediaSeeking::SetPositions(t)` (+ `Pause`) | A paused parser returns the **previous keyframe**: an edit at 8.6 s jumped the picture *and the player's position* back to the start of the file |
+| `IMediaControl::Run()` immediately followed by `Pause()` | Nothing changed at all — without waiting for a frame to be presented, the transition completes with nothing handed over |
+| `IVideoFrameStep::Step(1)` (the player's own frame-step path) | `CanStep 0x0 / Step 0x0` and a frame really was delivered while paused — but PotPlayer does not repaint a paused picture **even for its own "go to next frame" command**. That result closed the case |
+| `Stop()` then `Pause()` | Worked structurally, but desynchronised the player: its own play/seek commands stopped working afterwards |
+| `Pause()` on an already-paused graph | Never reaches the filters at all (the filter's second `Pause()` never happens), so it re-cues nothing |
+
+### Comparison preview (the panel's 对比 page): the supported answer
+
+Since no filter-side mechanism can repaint the player's frozen picture, the panel
+provides its own view instead: a **对比** tab that opens a separate window showing the
+current frame twice — as it arrived (left) and as the engine renders it (right) —
+split by a draggable divider (drag it, or nudge with ←/→), the same idea as NVIDIA
+ICAT's split view. This needs no cooperation from the player at all.
+
+How it is wired (both sides live in this DLL):
+
+- the filter mirrors every frame it processes into a guarded buffer while the compare
+  window is open — two packed, top-down **BGR24** images (DirectShow's `RGB24` is
+  already B,G,R in memory, so the panel hands them straight to `StretchDIBits`), plus
+  a sequence counter. When the window is closed, nothing is copied at all;
+- on every parameter edit, `DlssNrApply()` still notifies the filter
+  (`DlssNrRefreshSinks`), and with the compare view open the filter **re-runs the
+  frame it kept through the engine** and bumps the sequence. That is what makes a
+  paused edit visible: it never touches the graph;
+- the window repaints on a 120 ms timer when the sequence changes, letterboxes the
+  frame to its client area, and draws the two halves with a clip region each side of
+  the divider.
+
+The player's side stays untouched: a parameter change made while paused only updates
+the engine options (the next frame that plays carries them), and the filter contains
+no `IMediaControl`, `IMediaSeeking` or `IVideoFrameStep` call of any kind.
+
 ---
 
 ## Buffer contracts

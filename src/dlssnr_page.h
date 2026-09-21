@@ -70,8 +70,8 @@ public:
         info->pszDocString = nullptr;
         info->pszHelpFile = nullptr;
         info->dwHelpContext = 0;
-        info->size.cx = 348;
-        info->size.cy = 250;
+        info->size.cx = DlssNrWantWidth(false);
+        info->size.cy = DlssNrWantHeight(false);
         const wchar_t* t = L"DLSSNR";
         size_t cb = (wcslen(t) + 1) * sizeof(wchar_t);
         info->pszTitle = (LPOLESTR)CoTaskMemAlloc(cb);
