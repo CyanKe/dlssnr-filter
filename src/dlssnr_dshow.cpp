@@ -37,6 +37,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#include "dlssnr_engine.h"          // the built-in GPU engine
+#if defined(_M_X64) || defined(_M_IX86)
+#include <intrin.h>      // __cpuid
+#include <tmmintrin.h>   // SSSE3 pshufb, for the vectorised colour conversion
+#endif
 
 // ---------------------------------------------------------------------------
 // our filter CLSID: {3A44CEB0-B660-4131-A965-0EE8BA547C26}
@@ -345,6 +350,12 @@ static int    g_prevW = 0, g_prevH = 0;
 static LONG   g_prevSeq = 0;         // bumped whenever the images change
 static size_t g_prevCap = 0;         // bytes per image
 static BYTE*  g_prevBuf = nullptr;   // [0,cap) original, [cap,2*cap) processed
+// The compare view refreshes by re-running the engine on the frame it kept.
+// That frame is kept as BGR24 (the panel wants DIB order), so the refresh makes
+// a round trip BGR24 -> NV12 -> engine -> NV12 -> BGR24, needing its own pair of
+// NV12 buffers (a conversion cannot run in place).
+static BYTE*  g_prevNv12    = nullptr;
+static size_t g_prevNv12Cap = 0;      // bytes per NV12 image
 
 static bool     DlssNrPreviewWant()    { return g_prevOn; }
 static void     DlssNrPreviewSetWant(bool on) { g_prevOn = on; }
@@ -471,13 +482,12 @@ static float ClampRange(float v, float lo, float hi, float fallback) {
 }
 
 // ---------------------------------------------------------------------------
-// engine loader (dlssnr_host2.dll)
+// engine: built in (src/dlssnr_engine.cpp)
 // ---------------------------------------------------------------------------
-typedef int  (*FnInit)(int, int, const wchar_t*);
-typedef int  (*FnProcess)(unsigned char*, unsigned char*, int);
-typedef void (*FnSetOptions)(int, float, float, float, float, int, int);
-typedef void (*FnSetAppDir)(const wchar_t*);
-typedef void (*FnGetSizes)(int*, int*);
+// This used to LoadLibrary("dlssnr_host2.dll") -- the engine host published by
+// the separate dlssnr-toolkit repository -- and feed it CPU-converted BGR24.
+// The engine now lives in this DLL and speaks NV12 end to end, so there is
+// nothing to load and no NTSC-era colour conversion on the CPU.
 
 class Engine {
 public:
@@ -494,9 +504,9 @@ public:
     // passthrough until the player itself was restarted. One engine per process
     // is the only arrangement that matches NGX's lifetime rules.
     //
-    // A resolution change still works: that path calls dlssnr2_init() again,
-    // which reuses the D3D12 device and only rebuilds the feature + slots (the
-    // contract documented by dlssnr2_shutdown / docs/ENGINE_INTERFACE.md).
+    // A resolution change still works: that path calls dlssnr::Init() again,
+    // which reuses the D3D12 device and rebuilds only the NGX feature and the
+    // frame resources (see src/dlssnr_engine.cpp).
     //
     // Deliberately leaked: it owns a worker thread whose code lives in this DLL,
     // so running its destructor while the module is being unloaded would execute
@@ -505,8 +515,7 @@ public:
         static Engine* inst = CreatePinned();
         return *inst;
     }
-    Engine() : m_dll(nullptr), m_fnInit(nullptr), m_fnProcess(nullptr),
-               m_fnSetOptions(nullptr), m_ready(false), m_failed(false),
+    Engine() : m_ready(false), m_failed(false),
                m_w(0), m_h(0), m_thread(nullptr),
                m_evtWake(nullptr), m_quit(false) {
         InitializeCriticalSection(&m_lock);
@@ -521,11 +530,14 @@ public:
         if (m_evtWake) SetEvent(m_evtWake);
         if (m_thread) { WaitForSingleObject(m_thread, 30000); CloseHandle(m_thread); }
         if (m_evtWake) CloseHandle(m_evtWake);
-        // Deliberately NOT FreeLibrary(m_dll): unloading the host would discard
+        // The engine is in-process now, but the rule still holds in spirit: the NGX
+    // core outlives every filter instance and must never be torn down, because
+    // re-initialising it in one process is not safe. The original reason:
+    // unloading the host would discard
         // its "NGX already inited" latch, and the next dlssnr2_init() would call
         // Init_Ext a second time and fail with 0xBAD00002 -- the exact bug the
         // process-wide Engine::Instance() above exists to prevent. Process exit
-        // reclaims it, so m_dll simply stays loaded.
+        // reclaims it, so the payload module simply stays loaded.
         DeleteCriticalSection(&m_lock);
     }
 
@@ -550,7 +562,6 @@ public:
         m_gaveUp = false;
         m_tries = 0;
         m_tryW = m_tryH = 0;
-        m_loadFailed = false;
         m_failed = false;
     }
 
@@ -592,6 +603,17 @@ public:
         LeaveCriticalSection(&m_lock);
         if (first) SetOptions(enabled, style, intensity, tone, strct, skin, autoMask);
     }
+    dlssnr::Options Opts() const {
+        dlssnr::Options o;
+        o.style = m_optStyle;
+        o.intensity = m_optIntensity;
+        o.localTone = m_optTone;
+        o.localStruct = m_optStrct;
+        o.skinStruct = m_optSkin;
+        o.autoMask = m_optAutoMask ? 1 : 0;
+        o.uiCorrection = 0;
+        return o;
+    }
     int   OptStyle()     { return m_optStyle; }
     float OptIntensity() { return m_optIntensity; }
     float OptTone()      { return m_optTone; }
@@ -612,10 +634,9 @@ public:
         m_optAutoMask = autoMask;
         InterlockedIncrement(&m_paramRev);
         m_optDirty = true;
-        if (m_ready && m_fnSetOptions) {
+        if (m_ready) {
             EnterCriticalSection(&m_lock);
-            m_fnSetOptions(m_optStyle, m_optIntensity, m_optTone, m_optStrct,
-                           m_optSkin, m_optAutoMask ? 1 : 0, 0);
+            dlssnr::SetOptions(Opts());
             LeaveCriticalSection(&m_lock);
             m_optDirty = false;
         }
@@ -625,17 +646,22 @@ public:
     // MUST NOT block on the init lock: the worker holds it for the whole ~13 s
     // model load, and this runs on the player's streaming thread. If an init is
     // in flight we simply pass this frame through (TryEnterCriticalSection).
-    bool Process(const BYTE* src, BYTE* dst, int w, int h, bool reset) {
+    // One NV12 frame in, one NV12 frame out. The colour conversion and the
+    // neural pass both run on the GPU; all the CPU does is copy two planes.
+    bool ProcessNv12(const BYTE* inY, int inYStride, const BYTE* inUV, int inUVStride,
+                     BYTE* outY, int outYStride, BYTE* outUV, int outUVStride,
+                     int w, int h, bool reset) {
         // Load the size fields once into locals; they are written under the lock
         // by the worker, so reading them twice could see torn values.
         const int readyW = m_w, readyH = m_h;
-        if (!m_ready || readyW != w || readyH != h || !m_fnProcess) return false;
+        if (!m_ready || readyW != w || readyH != h) return false;
         if (!TryEnterCriticalSection(&m_lock)) return false;   // init in progress
         // Re-check under the lock: m_ready may have flipped since the cheap test.
         double t0 = NowMsLocal();
         bool ok = false;
-        if (m_ready && m_w == w && m_h == h && m_fnProcess) {
-            ok = m_fnProcess((unsigned char*)src, dst, reset ? 1 : 0) != 0;
+        if (m_ready && m_w == w && m_h == h) {
+            ok = dlssnr::ProcessNv12(inY, inYStride, inUV, inUVStride,
+                                     outY, outYStride, outUV, outUVStride, reset);
         }
         LeaveCriticalSection(&m_lock);
         if (!ok) { LogRaw("engine: process failed %dx%d -> passthrough", w, h); return false; }
@@ -671,8 +697,6 @@ private:
             LeaveCriticalSection(&m_lock);
 
             if (needInit) {
-                // A failed load is permanent for this process; don't retry it.
-                if (m_loadFailed) { WaitForSingleObject(m_evtWake, 1000); continue; }
                 // A failed init must NOT be retried in a hot loop: the old code
                 // spun here thousands of times a second, pegging a core and
                 // flooding the log. After kMaxTries attempts for one geometry,
@@ -705,13 +729,11 @@ private:
         m_ready = false;
         LeaveCriticalSection(&m_lock);
 
-        if (!Load()) return;
-
         Config cfg = ReadConfig();
 
-        wchar_t log[MAX_PATH];
-        _snwprintf_s(log, _countof(log), _TRUNCATE, L"%s\\%s", g_dir, kLogName);
-        LogRaw("engine: init %dx%d (model load may take ~13 s)...", w, h);
+        char log[MAX_PATH];
+        _snprintf_s(log, sizeof(log), _TRUNCATE, "%ls\\%ls", g_dir, kLogName);
+        LogRaw("engine: init %dx%d (model load may take a few seconds)...", w, h);
 
         // The whole init must hold m_lock: dlssnr2_init() releases and recreates
         // the D3D12 feature + textures, while the player's streaming thread may
@@ -721,21 +743,18 @@ private:
         // Prefer the cached options: if the panel changed something while the
         // model was still loading, that choice must survive the init rather than
         // being overwritten by the INI values read at construction time.
-        if (m_optDirty) {
-            m_fnSetOptions(m_optStyle, m_optIntensity, m_optTone, m_optStrct,
-                           m_optSkin, m_optAutoMask ? 1 : 0, 0);
-        } else {
+        if (!m_optDirty) {
             m_optStyle = cfg.style; m_optIntensity = cfg.intensity;
             m_optTone = cfg.localTone; m_optStrct = cfg.localStruct;
             m_optSkin = cfg.skinStruct; m_optAutoMask = cfg.autoMask;
             m_optEnabled = cfg.enabled;
-            m_fnSetOptions(cfg.style, cfg.intensity, cfg.localTone, cfg.localStruct,
-                           cfg.skinStruct, cfg.autoMask ? 1 : 0, 0);
         }
+        dlssnr::SetOptions(Opts());
         m_optDirty = false;
-        int ok = m_fnInit(w, h, log);
+        const bool ok = dlssnr::Init(w, h, g_dir, log);
         if (ok) {
-            m_fnGetSizes(&m_w, &m_h);
+            m_w = dlssnr::Width();
+            m_h = dlssnr::Height();
             m_ready = true;
             m_failed = false;
         }
@@ -750,37 +769,6 @@ private:
         // native control panel; nothing to launch from here (and no Python).
     }
 
-    bool Load() {
-        if (m_dll) return true;
-        wchar_t path[MAX_PATH];
-        _snwprintf_s(path, _countof(path), _TRUNCATE, L"%s\\%s", g_dir, kHostDll);
-        m_dll = LoadLibraryW(path);
-        if (!m_dll) {
-            LogRaw("engine: LoadLibraryW(%ls) failed err=%lu", path, GetLastError());
-            // Set a latch: a failed load must not be retried on every wake-up.
-            m_loadFailed = true;
-            return false;
-        }
-        m_fnInit       = (FnInit)      GetProcAddress(m_dll, "dlssnr2_init");
-        m_fnProcess    = (FnProcess)   GetProcAddress(m_dll, "dlssnr2_process");
-        m_fnSetOptions = (FnSetOptions)GetProcAddress(m_dll, "dlssnr2_set_options");
-        m_fnGetSizes   = (FnGetSizes)  GetProcAddress(m_dll, "dlssnr2_get_sizes");
-        FnSetAppDir fnSetDir = (FnSetAppDir)GetProcAddress(m_dll, "dlssnr2_set_appdir");
-        if (!m_fnInit || !m_fnProcess || !m_fnSetOptions || !m_fnGetSizes) {
-            LogRaw("engine: host DLL exports missing");
-            m_loadFailed = true;
-            return false;
-        }
-        // The engine assets (nvngx_dlssnr.dll etc.) ship next to this filter.
-        if (fnSetDir) fnSetDir(g_dir);
-        return true;
-    }
-
-    HMODULE      m_dll;
-    FnInit       m_fnInit;
-    FnProcess    m_fnProcess;
-    FnSetOptions m_fnSetOptions;
-    FnGetSizes   m_fnGetSizes;
     volatile bool m_ready;
     volatile bool m_failed;
     int          m_w, m_h;
@@ -795,7 +783,6 @@ private:
     static const int kMaxTries = 3;
     int  m_tryW = 0, m_tryH = 0, m_tries = 0;
     bool m_gaveUp = false;
-    volatile bool m_loadFailed = false;
     // Set by NewSession() (a player thread) and consumed by the worker, which
     // owns the actual bookkeeping fields.
     volatile LONG m_sessionReset = 0;
@@ -898,10 +885,24 @@ static long SampleSizeOf(const AM_MEDIA_TYPE* pmt, int w, int h) {
 // ---------------------------------------------------------------------------
 static inline BYTE Clip8(int v) { return (BYTE)(v < 0 ? 0 : (v > 255 ? 255 : v)); }
 
-// Converts one NV12 frame to packed BGR24 (BT.709 limited range, matching the
-// "色彩空间" typical HD sources report; measured round-trip error <= 3/255).
-static void Nv12ToBgr24(const BYTE* src, int w, int h, int strideY, int strideUV,
-                        BYTE* dst) {
+// ---------------------------------------------------------------------------
+// NV12 -> packed BGR24.
+//
+// This is on the per-frame hot path, and the scalar version is expensive: at
+// 3840x2076 it costs ~29 ms/frame, i.e. 0.82 GB/s of output - two orders of
+// magnitude below memory bandwidth, so it is instruction-bound, not
+// bandwidth-bound. The build is /O2 with no /arch: flag, so MSVC never
+// vectorised it. The host DLL (dlssnr-toolkit) already vectorises its own
+// BGR<->RGBA helpers with SSSE3, so this just brings the filter to the same
+// standard. Measured ~13x faster, and BIT-EXACT with the scalar loop it
+// replaces (verified byte-for-byte over odd geometries, 1x1, 3840x2076, and
+// real 4K frames - see tools/simd_conv_nv12_to_bgr.cpp).
+//
+// Coefficients are BT.709 limited range, matching the "色彩空间" typical HD
+// sources report; measured round-trip error <= 3/255.
+// ---------------------------------------------------------------------------
+static void Nv12ToBgr24_scalar(const BYTE* src, int w, int h, int strideY, int strideUV,
+                               BYTE* dst) {
     for (int y = 0; y < h; ++y) {
         const BYTE* yrow = src + (size_t)y * strideY;
         const BYTE* uv = src + (size_t)strideY * h + (size_t)(y >> 1) * strideUV;
@@ -918,6 +919,101 @@ static void Nv12ToBgr24(const BYTE* src, int w, int h, int strideY, int strideUV
             drow[x * 3 + 2] = Clip8((298 * C + 459 * E + 128) >> 8);           // R
         }
     }
+}
+
+#if defined(_M_X64) || defined(_M_IX86)
+// Filled once in DllMain; DllMain runs before any pin exists.
+static bool g_convSSSE3 = false;
+
+// 8 pixels -> 8 channel bytes in the low half of the register. idx: 0=B 1=G 2=R.
+static inline __m128i Nv12Bgr8(__m128i C, __m128i D, __m128i E, int idx) {
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i k128 = _mm_set1_epi32(128);
+    __m128i lo, hi, p;
+    if (idx == 0) {                                    // B = (298C + 541D + 128)>>8
+        const __m128i k = _mm_setr_epi16(298, 541, 298, 541, 298, 541, 298, 541);
+        lo = _mm_madd_epi16(_mm_unpacklo_epi16(C, D), k);
+        hi = _mm_madd_epi16(_mm_unpackhi_epi16(C, D), k);
+    } else if (idx == 2) {                             // R = (298C + 459E + 128)>>8
+        const __m128i k = _mm_setr_epi16(298, 459, 298, 459, 298, 459, 298, 459);
+        lo = _mm_madd_epi16(_mm_unpacklo_epi16(C, E), k);
+        hi = _mm_madd_epi16(_mm_unpackhi_epi16(C, E), k);
+    } else {                                           // G = (298C - 55D - 136E + 128)>>8
+        const __m128i kcd = _mm_setr_epi16(298, -55, 298, -55, 298, -55, 298, -55);
+        const __m128i ke  = _mm_setr_epi16(-136, 0, -136, 0, -136, 0, -136, 0);
+        lo = _mm_add_epi32(_mm_madd_epi16(_mm_unpacklo_epi16(C, D), kcd),
+                           _mm_madd_epi16(_mm_unpacklo_epi16(E, zero), ke));
+        hi = _mm_add_epi32(_mm_madd_epi16(_mm_unpackhi_epi16(C, D), kcd),
+                           _mm_madd_epi16(_mm_unpackhi_epi16(E, zero), ke));
+    }
+    // >>8 is arithmetic: the scalar code shifts a signed int.
+    lo = _mm_srai_epi32(_mm_add_epi32(lo, k128), 8);
+    hi = _mm_srai_epi32(_mm_add_epi32(hi, k128), 8);
+    p  = _mm_packs_epi32(lo, hi);                      // 8 x int16 (saturated)
+    return _mm_packus_epi16(p, p);                     // 8 bytes, clipped 0..255 = Clip8
+}
+
+static void Nv12ToBgr24_simd(const BYTE* src, int w, int h, int strideY, int strideUV,
+                             BYTE* dst) {
+    const BYTE* uvbase = src + (size_t)strideY * h;
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i c16  = _mm_set1_epi16(16);
+    const __m128i c128 = _mm_set1_epi16(128);
+    // bg = [B0 G0 B1 G1 ...]; splice R into every 3rd byte of the BGR stream.
+    const __m128i m_bg0 = _mm_setr_epi8(0,1,-1,2,3,-1,4,5,-1,6,7,-1,8,9,-1,10);
+    const __m128i m_r0  = _mm_setr_epi8(-1,-1,0,-1,-1,1,-1,-1,2,-1,-1,3,-1,-1,4,-1);
+    const __m128i m_bg1 = _mm_setr_epi8(11,-1,12,13,-1,14,15,-1,-1,-1,-1,-1,-1,-1,-1,-1);
+    const __m128i m_r1  = _mm_setr_epi8(-1,5,-1,-1,6,-1,-1,7,-1,-1,-1,-1,-1,-1,-1,-1);
+
+    for (int y = 0; y < h; ++y) {
+        const BYTE* yrow  = src    + (size_t)y * strideY;
+        const BYTE* uvrow = uvbase + (size_t)(y >> 1) * strideUV;
+        BYTE* drow = dst + (size_t)y * w * 3;
+        int x = 0;
+        for (; x + 8 <= w; x += 8) {
+            __m128i Y = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i*)(yrow + x)), zero);
+            __m128i C = _mm_sub_epi16(Y, c16);
+
+            // 8 px need 4 chroma samples; in a packed NV12 row the chroma for
+            // pixel x starts at byte x.
+            __m128i UV = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i*)(uvrow + x)), zero);
+            __m128i D = _mm_shufflehi_epi16(_mm_shufflelo_epi16(UV, _MM_SHUFFLE(2,2,0,0)),
+                                            _MM_SHUFFLE(2,2,0,0));
+            __m128i E = _mm_shufflehi_epi16(_mm_shufflelo_epi16(UV, _MM_SHUFFLE(3,3,1,1)),
+                                            _MM_SHUFFLE(3,3,1,1));
+            D = _mm_sub_epi16(D, c128);
+            E = _mm_sub_epi16(E, c128);
+
+            __m128i bg = _mm_unpacklo_epi8(Nv12Bgr8(C, D, E, 0),   // B
+                                           Nv12Bgr8(C, D, E, 1));   // G
+            __m128i R  = Nv12Bgr8(C, D, E, 2);
+            __m128i c0 = _mm_or_si128(_mm_shuffle_epi8(bg, m_bg0),
+                                      _mm_shuffle_epi8(R,  m_r0));
+            __m128i c1 = _mm_or_si128(_mm_shuffle_epi8(bg, m_bg1),
+                                      _mm_shuffle_epi8(R,  m_r1));
+            BYTE* d = drow + (size_t)x * 3;
+            _mm_storeu_si128((__m128i*)d, c0);          // bytes 0..15
+            _mm_storel_epi64((__m128i*)(d + 16), c1);   // bytes 16..23
+        }
+        for (; x < w; ++x) {                            // tail
+            const int Y = yrow[x];
+            const int U = uvrow[(x >> 1) * 2];
+            const int V = uvrow[(x >> 1) * 2 + 1];
+            const int C = Y - 16, D = U - 128, E = V - 128;
+            drow[x * 3 + 0] = Clip8((298 * C + 541 * D + 128) >> 8);
+            drow[x * 3 + 1] = Clip8((298 * C - 55 * D - 136 * E + 128) >> 8);
+            drow[x * 3 + 2] = Clip8((298 * C + 459 * E + 128) >> 8);
+        }
+    }
+}
+#endif  // x86
+
+static void Nv12ToBgr24(const BYTE* src, int w, int h, int strideY, int strideUV,
+                        BYTE* dst) {
+#if defined(_M_X64) || defined(_M_IX86)
+    if (g_convSSSE3) { Nv12ToBgr24_simd(src, w, h, strideY, strideUV, dst); return; }
+#endif
+    Nv12ToBgr24_scalar(src, w, h, strideY, strideUV, dst);
 }
 
 // Converts packed BGR24 back to NV12. Chroma is averaged over each 2x2 block,
@@ -2028,10 +2124,36 @@ public:
         const int h = g_prevH;
         need = (size_t)(w > 0 ? w : 0) * 3 * (size_t)(h > 0 ? h : 0);
         if (g_prevBuf && w > 0 && h > 0 && g_prevCap >= need) {
-            EnterCriticalSection(&g_prevCs);
-            memcpy(m_scratchIn, g_prevBuf, need);
-            LeaveCriticalSection(&g_prevCs);
-            if (EnsureScratch(need) && m_engine.Process(m_scratchIn, m_scratchOut, w, h, false)) {
+            const size_t nv12Need = (size_t)w * h * 3 / 2;
+            bool refreshed = false;
+            // EnsureScratch MUST run before anything touches m_scratchIn/Out.
+            // It is the only place they are allocated, and the streaming path no
+            // longer calls it (the engine takes NV12 straight through), so there
+            // is no longer any earlier path that guarantees they exist. Writing
+            // the memcpy before this call crashed with 0xC0000005 on the first
+            // parameter edit made with the compare window open.
+            if (EnsureScratch(need)) {
+                EnterCriticalSection(&g_prevCs);
+                memcpy(m_scratchIn, g_prevBuf, need);
+                LeaveCriticalSection(&g_prevCs);
+
+                if (g_prevNv12Cap < nv12Need) {
+                    BYTE* nb = (BYTE*)realloc(g_prevNv12, nv12Need * 2);
+                    if (nb) { g_prevNv12 = nb; g_prevNv12Cap = nv12Need; }
+                }
+                if (g_prevNv12 && g_prevNv12Cap >= nv12Need) {
+                    BYTE* nvIn  = g_prevNv12;
+                    BYTE* nvOut = g_prevNv12 + nv12Need;
+                    Bgr24ToNv12(m_scratchIn, w, h, w, w, nvIn);
+                    if (m_engine.ProcessNv12(nvIn, w, nvIn + (size_t)w * h, w,
+                                             nvOut, w, nvOut + (size_t)w * h, w,
+                                             w, h, false)) {
+                        DlssNrToBgr24(nvOut, w, h, 3, true, w, m_scratchOut);
+                        refreshed = true;
+                    }
+                }
+            }
+            if (refreshed) {
                 EnterCriticalSection(&g_prevCs);
                 if (g_prevBuf && g_prevCap >= need) {
                     memcpy(g_prevBuf + need, m_scratchOut, need);
@@ -2069,68 +2191,25 @@ public:
             reason = kReasonSizeMismatch;
             NoteOnce(&m_whySize, "size changed since init; engine will re-init on next Pause");
             SetStatusLocal("resolution changed since init");
+        } else if (!isYuv) {
+            // The engine is NV12-only (src/dlssnr_engine.cpp). RGB24 / RGB32
+            // frames are passed through untouched, with a reason the panel can
+            // show, rather than being half-processed.
+            reason = kReasonBpp;
+            NoteOnce(&m_whyBpp, "input is not NV12 (engine handles NV12 only) - passing through");
+            SetStatusLocal("input not NV12 - engine handles NV12 only");
         } else {
-            // scratchIn/out are always packed BGR24 (w*3 * h)
-            if (!EnsureScratch((size_t)packed * h)) {
-                reason = kReasonProcessFail;
+            // Straight through: NV12 in, NV12 out. No CPU colour conversion.
+            const BYTE* uvIn = pSrc + (size_t)inStride * h;
+            BYTE* uvOut = pDst + (size_t)outStride * h;
+            done = m_engine.ProcessNv12(pSrc, inStride, uvIn, inStride,
+                                        pDst, outStride, uvOut, outStride,
+                                        w, h, m_needReset != 0);
+            if (done) {
+                m_needReset = false;
             } else {
-                const BYTE* engSrc = nullptr;
-                if (isYuv) {
-                    Nv12ToBgr24(pSrc, w, h, inStride, inStride, m_scratchIn);
-                    engSrc = m_scratchIn;
-                } else if (bpp == 3) {
-                    if (inStride == packed) {
-                        engSrc = pSrc;                  // direct, no copy at all
-                    } else {
-                        for (int y = 0; y < h; ++y)
-                            memcpy(m_scratchIn + (size_t)y * packed,
-                                   pSrc + (size_t)y * inStride, packed);
-                        engSrc = m_scratchIn;
-                    }
-                } else {
-                    // RGB32: the engine wants BGR24, so drop the 4th byte and
-                    // keep DIB order (byte0=B, byte1=G, byte2=R).
-                    for (int y = 0; y < h; ++y) {
-                        const BYTE* s = pSrc + (size_t)y * inStride;
-                        BYTE* d = m_scratchIn + (size_t)y * packed;
-                        for (int x = 0; x < w; ++x) {
-                            d[x * 3 + 0] = s[x * 4 + 0];
-                            d[x * 3 + 1] = s[x * 4 + 1];
-                            d[x * 3 + 2] = s[x * 4 + 2];
-                        }
-                    }
-                    engSrc = m_scratchIn;
-                }
-
-                BYTE* engDst = (isYuv || bpp != 3 || inStride != packed)
-                               ? m_scratchOut : pDst;
-                done = m_engine.Process(engSrc, engDst, w, h, m_needReset);
-                if (done) {
-                    m_needReset = false;
-                    if (engDst != pDst) {
-                        if (isYuv) {
-                            Bgr24ToNv12(m_scratchOut, w, h, outStride, outStride, pDst);
-                        } else if (bpp == 3) {
-                            for (int y = 0; y < h; ++y)
-                                memcpy(pDst + (size_t)y * outStride,
-                                       m_scratchOut + (size_t)y * packed, packed);
-                        } else {
-                            for (int y = 0; y < h; ++y) {
-                                const BYTE* s = m_scratchOut + (size_t)y * packed;
-                                BYTE* d = pDst + (size_t)y * outStride;
-                                for (int x = 0; x < w; ++x) {
-                                    d[x * 4 + 0] = s[x * 3 + 0];
-                                    d[x * 4 + 1] = s[x * 3 + 1];
-                                    d[x * 4 + 2] = s[x * 3 + 2];
-                                    d[x * 4 + 3] = 255;
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    reason = kReasonProcessFail;
-                    SetStatusLocal("engine error - passing through");
-                }
+                reason = kReasonProcessFail;
+                SetStatusLocal("engine error - passing through");
             }
         }
         if (!done) {
@@ -2685,6 +2764,13 @@ STDAPI DllUnregisterServer() {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
+#if defined(_M_X64) || defined(_M_IX86)
+        {   // SSSE3 (pshufb) is used by the vectorised NV12<->BGR24 path.
+            int f[4] = { 0, 0, 0, 0 };
+            __cpuid(f, 1);
+            g_convSSSE3 = (f[2] & (1 << 9)) != 0;
+        }
+#endif
         InitModuleDir(hModule);
     } else if (reason == DLL_PROCESS_DETACH) {
         CloseShared();

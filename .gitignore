@@ -30,6 +30,7 @@ rtx_sdk_legal/
 # --- build output ---------------------------------------------------------
 build/
 *.obj
+*.exe
 *.lib
 *.exp
 *.pdb
