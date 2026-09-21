@@ -57,3 +57,7 @@ venv/
 *.swp
 Thumbs.db
 desktop.ini
+
+# --- live settings written back by the panel (see app/dlssnr_dshow.ini.template) --
+app/dlssnr_dshow.ini
+

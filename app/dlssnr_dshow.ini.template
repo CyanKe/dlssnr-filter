@@ -1,10 +1,16 @@
 ; ===========================================================================
 ;  dlssnr_dshow.ini -- configuration for the DLSS Neural Render DirectShow filter
 ;
-;  Place this file next to dlssnr_dshow.dll. If it is absent the defaults below
-;  are used. Most keys are read when the filter is created (restart the player
-;  after editing); "autoshow" and "lang" are also written back by the control
-;  panel and applied live.
+;  This is the TEMPLATE: copy it to "dlssnr_dshow.ini" next to dlssnr_dshow.dll
+;  if you want to hand-edit settings. The filter reads that file when it is present
+;  and otherwise uses the built-in defaults listed below.
+;
+;  The control panel writes its live settings back to "dlssnr_dshow.ini" -- that
+;  file is local state and is NOT tracked by git, so this template always stays at
+;  the documented defaults.
+;
+;  Most keys are read when the filter is created (restart the player after editing);
+;  "autoshow" and "lang" are applied live.
 ;
 ;  NOTE: this file must keep CRLF line endings -- the Win32 profile API
 ;  (WritePrivateProfileString) only understands CRLF and will merge adjacent
