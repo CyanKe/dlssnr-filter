@@ -31,7 +31,7 @@ redistribute it in this project's source tree or in binary releases.
 | This project's own code (`src/`, `tools/`) | MIT | **Yes — that is the point** | Allowed under MIT terms |
 | `nvngx_dlssnr.dll` — **community build**, no official public release | The engine; must be placed in `app\` by the user | **No — gitignored** | **Do not redistribute.** Neither NVIDIA's terms nor the community build's provenance permit it; treat as internal-use only |
 | NVIDIA NGX runtime — `nvngx_vsr.dll`, `nvngx_truehdr.dll`, `nvngxruntime.dll` | Runs locally once present | **No — gitignored** | **Not permitted.** `LicenseRef-NvidiaProprietary` |
-| NVIDIA NGX SDK — headers under `deps/sdk_include/`, `nvsdk_ngx_s.lib` | Needed to compile `dlssnr_host2.dll` | **No — gitignored** | **Not permitted** without an express NVIDIA agreement |
+| NVIDIA NGX SDK — headers under `deps/sdk_include/`, `nvsdk_ngx_s.lib` | Needed to **build this filter** (compile-time only — the shipped `dlssnr_dshow.dll` does not load or need the SDK) | **No — gitignored** | **Not permitted** without an express NVIDIA agreement |
 | NVIDIA RTX Video SDK 1.1 — `NVVideoEffects.dll`, `NVCVImage.dll`, `nvVFXVideoSuperRes.dll`, `deps/rtx_video_sdk/` | Runs locally once present | **No — gitignored** | **Not permitted** as part of this package |
 
 > **Note on `nvngx_dlssnr.dll`:** this is the one component with no clean answer. It is
