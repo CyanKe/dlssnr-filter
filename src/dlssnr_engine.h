@@ -60,7 +60,17 @@ struct Options {
 // Creates the device and the NGX feature at this geometry. `moduleDir` must be
 // the folder holding nvngx_dlssnr.dll (i.e. the filter DLL's own directory).
 // Returns false on any failure; the filter then stays in pass-through.
-bool Init(int width, int height, const wchar_t* moduleDir, const char* logPath);
+//
+// `scalePercent` is the size the NETWORK runs at, as a percentage of the video
+// size, clamped to [25, 100]; 100 (the default) is native. The frame that goes
+// in and the frame that comes out are ALWAYS at the video size -- only the
+// neural pass and the two colour conversions feeding it shrink, so no caller has
+// to know. Down is an area average (no aliasing), up is bilinear (soft). Asking
+// for a size that is too small, or for which the feature cannot be created,
+// silently falls back to native; ProcScalePercent() reports what was APPLIED, so
+// callers can tell the user the truth.
+bool Init(int width, int height, const wchar_t* moduleDir, const char* logPath,
+          int scalePercent = 100);
 
 // Drops the GPU resources but keeps the D3D12 device and the NGX core alive --
 // re-initialising NGX a second time in one process is not safe, and a player
@@ -68,8 +78,11 @@ bool Init(int width, int height, const wchar_t* moduleDir, const char* logPath);
 void Shutdown();
 
 bool Ready();
-int  Width();
+int  Width();              // the video size: what ProcessNv12 takes and returns
 int  Height();
+int  ProcWidth();          // the size the network runs at (== Width() at 100%)
+int  ProcHeight();
+int  ProcScalePercent();   // 100 or 50, as applied (may have fallen back to 100)
 
 void SetOptions(const Options& o);
 

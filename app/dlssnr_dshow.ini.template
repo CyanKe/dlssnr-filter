@@ -63,6 +63,62 @@ skinstructure=0
 automask=0
 
 ; ---------------------------------------------------------------------------
+; Late-frame policy -- dropframes / maxlagms
+; ---------------------------------------------------------------------------
+; The filter runs the engine on the player's streaming thread, one call per
+; frame. When that costs MORE than the frame interval, the video branch cannot
+; follow the reference clock: every frame ends up a little late, and the offset
+; from the audio ACCUMULATES -- the picture looks like slow motion. Measured on
+; this machine: 4K60 needs 34.7 ms against a 16.7 ms budget, 2560x1440 120 Hz
+; needs 17.7 ms against 8.3 ms.
+;
+; 1 (default) = refuse the frames that can no longer be shown on time. The
+;   frames that ARE delivered keep their original timestamps, so the offset
+;   stops growing and settles at about one engine run. Expect ~29 fps from a
+;   4K60 source and ~56 fps from 2560x1440 120 Hz: choppy, but in sync.
+; 0 = the old behaviour: every frame is processed and delivered, and the
+;   picture drifts further behind the sound the longer the file plays.
+dropframes=1
+
+; Ceiling on the lateness the policy tolerates, in milliseconds.
+; 0 (default) = one engine run + one frame interval, which adapts to whatever
+; the engine actually costs. A larger value keeps more frames (slightly
+; smoother, more offset) and can never go below the automatic value, because
+; anything less would mean dropping nearly every frame.
+maxlagms=0
+
+; ---------------------------------------------------------------------------
+; Reduced-resolution processing -- procenable / procscale
+; ---------------------------------------------------------------------------
+; Runs the neural pass on a SMALLER frame (the video going in and out is still
+; full size; only the network's own resolution shrinks) and upscales its output.
+; This is the other way to make an engine that cannot keep up fit the budget --
+; instead of showing fewer frames, it shows all of them, softer.
+;
+; Measured on this machine at 4K (tools\bench_procscale.cpp):
+;   100% -> 34.7 ms (native)      50% -> ~12 ms      25% -> ~10 ms
+; so 4K60 needs ~50% or less. At 1080p the same curve runs 10.5 / 5.0 / 4.0 ms.
+;
+; The picture cost is real and is NOT just softness: the downscale happens
+; BEFORE the network, which removes the noise it was trained to remove, so the
+; DENOISING basically stops -- with the local tone/structure dialled to 0 its
+; output differs from a plain resample by 0.5 grey levels, against 6.7 for the
+; native path. What is left is a soft picture plus whatever those two local
+; controls do. The network also stops behaving predictably: different
+; percentages change the look in ways that are NOT monotone, so pick the value
+; BY EYE with the panel's 对比 (Compare) page. Details, numbers, and the two
+; chroma bugs this feature found on the way: docs\ENGINEERING_NOTES.md section 8.
+;
+; 0 (default) = off, i.e. native resolution. 1 = on, using procscale below.
+procenable=0
+
+; The size the network runs at, as a percentage of the video size: 25..100.
+; Remembered while procenable=0, so switching the feature on restores it.
+; The panel slider only applies when a drag ends -- each change re-creates the
+; NGX session (~0.2 s, frames pass through while it does).
+procscale=50
+
+; ---------------------------------------------------------------------------
 ; Control panel (native Win32 window owned by the filter -- no Python needed)
 ; ---------------------------------------------------------------------------
 ; Open the control panel automatically once the engine is ready, i.e. as soon

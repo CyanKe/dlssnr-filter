@@ -261,6 +261,163 @@ void rgba_to_uv(uint3 tid : SV_DispatchThreadID) {
 }
 )HLSL";
 
+// ------------------------------------------------------- scaled-resolution path
+// The four shaders above are untouched, so a 100% session stays bit-identical to
+// what it always produced. These two are used for any scalePercent < 100: the
+// network (and the two colour conversions feeding it) run on a smaller frame,
+// while the planes going in and out stay at the VIDEO size. No caller ever sees
+// a different geometry -- only the neural pass shrinks, which is where all the
+// time is (measured T(ms) ~ 2.9 + 3.83 x MPix: 4K = 34.7 ms, 1080p = 10.7).
+//
+// Down is a real AREA average: each output pixel averages exactly the source box
+// it covers, with fractional weights on the two edge samples of each axis. That
+// is the one resampling that cannot alias. Up is bilinear (a tent filter) on the
+// network's pixels, which is where the softness comes from. At exactly 2:1 both
+// reduce to the obvious thing -- a 2x2 box, and the 0.25/0.75 taps -- which is
+// the case this was first written for and measured on.
+//
+// Measured 2026-09 (tools\bench_procscale.cpp): the speed is real (4K60: 34.7 ->
+// ~12 ms) but the picture is not worth showing. Pre-smoothing the frame before
+// the network destroys the noise it was trained to remove, so it stops
+// denoising: its output differs from a plain resample by 0.25 grey levels
+// against 6.5 for the native path. And the local tone/structure controls, being
+// neighbourhood operators, grow to blotches when the frame shrinks under them.
+// The switch exists because it is the user's call and it is measurable; the
+// default is 100 and docs\ENGINEERING_NOTES.md section 8 has the numbers.
+static const char* kSrcNv12ToRgbaScale = R"HLSL(
+cbuffer Params : register(b0) { uint W; uint H; uint SW; uint SH; };
+Texture2D<float>    sY    : register(t0);
+Texture2D<float2>   sUV   : register(t1);
+RWTexture2D<float4> uRGBA : register(u0);
+
+// Overlap of source sample i with the box [a,b): the weight an area average
+// gives it. Only the two edge samples get a partial weight.
+float TapW(int i, float a, float b) {
+    float lo = max((float)i, a);
+    float hi = min((float)i + 1.0, b);
+    return max(0.0, hi - lo);
+}
+
+[numthreads(8,8,1)]
+void nv12_to_rgba_scale(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= SW || tid.y >= SH) return;
+    const float sx = (float)W / (float)SW;      // source samples per output pixel
+    const float sy = (float)H / (float)SH;
+    const float xa = (float)tid.x * sx, xb = xa + sx;
+    const float ya = (float)tid.y * sy, yb = ya + sy;
+
+    float sumY = 0.0, sumW = 0.0;
+    for (int j = (int)floor(ya); j < (int)ceil(yb); ++j) {
+        const float wy = TapW(j, ya, yb);
+        if (wy <= 0.0) continue;
+        const int cy = min(max(j, 0), (int)H - 1);
+        for (int i = (int)floor(xa); i < (int)ceil(xb); ++i) {
+            const float wx = TapW(i, xa, xb);
+            if (wx <= 0.0) continue;
+            const int cx = min(max(i, 0), (int)W - 1);
+            sumY += wx * wy * sY.Load(int3(cx, cy, 0));
+            sumW += wx * wy;
+        }
+    }
+    const int Y = (int)((sumY / max(sumW, 0.000001)) * 255.0 + 0.5);
+
+    // Chroma: the scaled frame has its OWN chroma plane, half its luma size, so
+    // one scaled chroma sample covers a box of `sx` VIDEO chroma samples -- and
+    // 2x2 scaled pixels share it, exactly like the native path's
+    // `sUV.Load(tid.xy >> 1)`. That makes the network's input look like a real
+    // NV12 frame of that size, which is the whole point.
+    //
+    // The obvious alternative -- one video chroma sample per scaled pixel, "the
+    // colour of exactly this block" -- hands the network a chroma that is
+    // sharper than any real frame; it answers with low-frequency blotches (see
+    // ENGINEERING_NOTES section 8). Note the box ORIGIN matters as much as its
+    // width: it must tile the CHROMA plane (cw wide), not the luma plane, or the
+    // colour only covers the left/top part of the picture and everything else
+    // clamps to the edge -- which looks like a grey frame with colour in one
+    // corner.
+    const int cw = (int)((W + 1u) / 2u), ch = (int)((H + 1u) / 2u);
+    const float csx = (float)W / (float)SW;          // == 2 * cw / SW
+    const float csy = (float)H / (float)SH;
+    const float cxa = (float)(tid.x >> 1) * csx, cxb = cxa + csx;
+    const float cya = (float)(tid.y >> 1) * csy, cyb = cya + csy;
+    float sumU = 0.0, sumV = 0.0, sumC = 0.0;
+    for (int j = (int)floor(cya); j < (int)ceil(cyb); ++j) {
+        const float wy = TapW(j, cya, cyb);
+        if (wy <= 0.0) continue;
+        const int cy = min(max(j, 0), ch - 1);
+        for (int i = (int)floor(cxa); i < (int)ceil(cxb); ++i) {
+            const float wx = TapW(i, cxa, cxb);
+            if (wx <= 0.0) continue;
+            const int cx = min(max(i, 0), cw - 1);
+            const float2 uv = sUV.Load(int3(cx, cy, 0));
+            sumU += wx * wy * uv.x;
+            sumV += wx * wy * uv.y;
+            sumC += wx * wy;
+        }
+    }
+    const int U = (int)((sumU / max(sumC, 0.000001)) * 255.0 + 0.5);
+    const int V = (int)((sumV / max(sumC, 0.000001)) * 255.0 + 0.5);
+
+    int C = Y - 16, D = U - 128, E = V - 128;
+    int B = clamp((298*C + 541*D + 128) >> 8, 0, 255);
+    int G = clamp((298*C - 55*D - 136*E + 128) >> 8, 0, 255);
+    int R = clamp((298*C + 459*E + 128) >> 8, 0, 255);
+    uRGBA[tid.xy] = float4(R, G, B, 255.0) / 255.0;
+}
+)HLSL";
+
+static const char* kSrcRgbaToNv12Scale = R"HLSL(
+cbuffer Params : register(b0) { uint W; uint H; uint SW; uint SH; };
+Texture2D<float4>   sRGB : register(t0);
+RWTexture2D<float>  uY   : register(u0);
+RWTexture2D<float2> uUV  : register(u1);
+
+// Bilinear fetch at a point given in the network's pixel coordinates (texel k
+// covers [k, k+1), so its centre is k + 0.5). Borders clamp to the edge texel.
+float4 FetchRGBA(float2 p) {
+    const float fx = floor(p.x), fy = floor(p.y);
+    const float tx = p.x - fx,  ty = p.y - fy;
+    const int mx = (int)SW - 1, my = (int)SH - 1;
+    int x0 = (int)fx, y0 = (int)fy;
+    x0 = min(max(x0, 0), mx); y0 = min(max(y0, 0), my);
+    const int x1 = min(x0 + 1, mx), y1 = min(y0 + 1, my);
+    float4 a = sRGB.Load(int3(x0, y0, 0));
+    float4 b = sRGB.Load(int3(x1, y0, 0));
+    float4 c = sRGB.Load(int3(x0, y1, 0));
+    float4 d = sRGB.Load(int3(x1, y1, 0));
+    return lerp(lerp(a, b, tx), lerp(c, d, tx), ty);
+}
+
+[numthreads(8,8,1)]
+void rgba_to_y_scale(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= W || tid.y >= H) return;
+    const float rx = (float)SW / (float)W, ry = (float)SH / (float)H;
+    float4 c = FetchRGBA(float2(((float)tid.x + 0.5) * rx - 0.5,
+                                ((float)tid.y + 0.5) * ry - 0.5));
+    int R = (int)(saturate(c.r) * 255.0 + 0.5);
+    int G = (int)(saturate(c.g) * 255.0 + 0.5);
+    int B = (int)(saturate(c.b) * 255.0 + 0.5);
+    int Y = ((47*R + 157*G + 16*B + 128) >> 8) + 16;   // same integers as rgba_to_y
+    uY[tid.xy] = (float)clamp(Y, 0, 255) / 255.0;
+}
+
+[numthreads(8,8,1)]
+void rgba_to_uv_scale(uint3 tid : SV_DispatchThreadID) {
+    const uint cw = (W + 1u) / 2u, ch = (H + 1u) / 2u;
+    if (tid.x >= cw || tid.y >= ch) return;
+    // A chroma sample covers video luma [2x, 2x+2), so its centre is luma 2x+1.
+    const float rx = (float)SW / (float)W, ry = (float)SH / (float)H;
+    float4 c = FetchRGBA(float2(((float)tid.x * 2.0 + 1.0) * rx - 0.5,
+                                ((float)tid.y * 2.0 + 1.0) * ry - 0.5));
+    int R = (int)(saturate(c.r) * 255.0 + 0.5);
+    int G = (int)(saturate(c.g) * 255.0 + 0.5);
+    int B = (int)(saturate(c.b) * 255.0 + 0.5);
+    int u = ((-26*R - 87*G + 112*B + 128) >> 8) + 128;
+    int v = ((112*R - 102*G - 10*B + 128) >> 8) + 128;
+    uUV[tid.xy] = float2((float)clamp(u, 0, 255), (float)clamp(v, 0, 255)) / 255.0;
+}
+)HLSL";
+
 // --------------------------------------------------------------- state
 enum { kDescCount = 9 };
 
@@ -277,6 +434,11 @@ struct State {
     ID3D12PipelineState*  psoToRgba = nullptr;
     ID3D12PipelineState*  psoY = nullptr;
     ID3D12PipelineState*  psoUV = nullptr;
+    // scaled-resolution variants (see kSrcNv12ToRgbaScale): used whenever the
+    // session was created with scalePercent < 100
+    ID3D12PipelineState*  psoToRgbaScale = nullptr;
+    ID3D12PipelineState*  psoYScale = nullptr;
+    ID3D12PipelineState*  psoUVScale = nullptr;
     ID3D12DescriptorHeap* heap = nullptr;
     UINT                  descStride = 0;
 
@@ -300,7 +462,9 @@ struct State {
     NVSDK_NGX_Handle*    feature = nullptr;
     NVSDK_NGX_Parameter* params = nullptr;
 
-    int w = 0, h = 0;
+    int w = 0, h = 0;             // the video size: what goes in and comes out
+    int sw = 0, sh = 0;            // the size the NETWORK runs at (== w,h at 100%)
+    int scalePct = 100;            // 100 or 50
     Options opt;
     bool ready = false;
 };
@@ -393,7 +557,10 @@ static bool CreateRootSigAndPipelines() {
     D3D12_ROOT_PARAMETER rp[5] = {};
     rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     rp[0].Constants.ShaderRegister = 0;
-    rp[0].Constants.Num32BitValues = 2;
+    // Four, not two: the half-resolution shaders need both the video size (W,H)
+    // and the network size (SW,SH), and the native shaders simply ignore the
+    // extra two constants.
+    rp[0].Constants.Num32BitValues = 4;
     rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     for (int i = 0; i < 4; ++i) {
         rp[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -425,9 +592,14 @@ static bool CreateRootSigAndPipelines() {
     if (!compile) { ELog("D3DCompile not found"); return false; }
 
     struct { const char* src; const char* entry; ID3D12PipelineState** out; const char* name; } jobs[] = {
-        { kSrcNv12ToRgba, "nv12_to_rgba", &g.psoToRgba, "nv12_to_rgba" },
-        { kSrcRgbaToNv12, "rgba_to_y",    &g.psoY,      "rgba_to_y" },
-        { kSrcRgbaToNv12, "rgba_to_uv",   &g.psoUV,     "rgba_to_uv" },
+        { kSrcNv12ToRgba,     "nv12_to_rgba",      &g.psoToRgba,     "nv12_to_rgba" },
+        { kSrcRgbaToNv12,     "rgba_to_y",         &g.psoY,          "rgba_to_y" },
+        { kSrcRgbaToNv12,     "rgba_to_uv",        &g.psoUV,         "rgba_to_uv" },
+        // Built unconditionally (they cost nothing until used) so a session can
+        // be re-created at another scale without recompiling shaders.
+        { kSrcNv12ToRgbaScale, "nv12_to_rgba_scale", &g.psoToRgbaScale, "nv12_to_rgba_scale" },
+        { kSrcRgbaToNv12Scale, "rgba_to_y_scale",    &g.psoYScale,      "rgba_to_y_scale" },
+        { kSrcRgbaToNv12Scale, "rgba_to_uv_scale",   &g.psoUVScale,     "rgba_to_uv_scale" },
     };
     for (auto& j : jobs) {
         ID3DBlob* code = nullptr; ID3DBlob* e2 = nullptr;
@@ -449,20 +621,25 @@ static bool CreateRootSigAndPipelines() {
     return true;
 }
 
-static bool CreateFrameResources(int w, int h) {
+// `sw`,`sh` is the size the network runs at; it is w,h for a 100% session.
+// Everything the caller sees (the NV12 planes, the upload/readback buffers)
+// stays at the video size -- only the RGBA working textures and the guidance
+// planes shrink with the network.
+static bool CreateFrameResources(int w, int h, int sw, int sh) {
     const int cw = (w + 1) / 2, ch = (h + 1) / 2;
     g.w = w; g.h = h; g.cw = cw; g.ch = ch;
+    g.sw = sw; g.sh = sh;
     g.yPitch  = Align256((UINT)w);
     g.uvPitch = Align256((UINT)cw * 2);
 
     g.yTex     = CreateTex(g.dev, DXGI_FORMAT_R8_UNORM,     w, h, true);
     g.uvTex    = CreateTex(g.dev, DXGI_FORMAT_R8G8_UNORM,   cw, ch, true);
-    g.texIn    = CreateTex(g.dev, DXGI_FORMAT_R8G8B8A8_UNORM, w, h, true);
-    g.texOut   = CreateTex(g.dev, DXGI_FORMAT_R8G8B8A8_UNORM, w, h, true);
+    g.texIn    = CreateTex(g.dev, DXGI_FORMAT_R8G8B8A8_UNORM, sw, sh, true);
+    g.texOut   = CreateTex(g.dev, DXGI_FORMAT_R8G8B8A8_UNORM, sw, sh, true);
     g.outYTex  = CreateTex(g.dev, DXGI_FORMAT_R8_UNORM,     w, h, true);
     g.outUVTex = CreateTex(g.dev, DXGI_FORMAT_R8G8_UNORM,   cw, ch, true);
-    g.zeroMV   = CreateTex(g.dev, DXGI_FORMAT_R16G16_FLOAT, w, h, true);
-    g.zeroDepth= CreateTex(g.dev, DXGI_FORMAT_R32_FLOAT,    w, h, true);
+    g.zeroMV   = CreateTex(g.dev, DXGI_FORMAT_R16G16_FLOAT, sw, sh, true);
+    g.zeroDepth= CreateTex(g.dev, DXGI_FORMAT_R32_FLOAT,    sw, sh, true);
 
     g.upY  = CreateBuf(g.dev, (UINT64)g.yPitch * h,      D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     g.upUV = CreateBuf(g.dev, (UINT64)g.uvPitch * ch,    D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -471,7 +648,7 @@ static bool CreateFrameResources(int w, int h) {
 
     if (!g.yTex || !g.uvTex || !g.texIn || !g.texOut || !g.outYTex || !g.outUVTex ||
         !g.zeroMV || !g.zeroDepth || !g.upY || !g.upUV || !g.rbY || !g.rbUV) {
-        ELog("frame resource allocation failed at %dx%d", w, h);
+        ELog("frame resource allocation failed at %dx%d (network %dx%d)", w, h, sw, sh);
         return false;
     }
 
@@ -639,23 +816,50 @@ static bool CreateFeatureAt(int w, int h) {
 }  // namespace
 
 // ------------------------------------------------------------- public API
-bool Init(int width, int height, const wchar_t* moduleDir, const char* logPath) {
+bool Init(int width, int height, const wchar_t* moduleDir, const char* logPath,
+          int scalePercent) {
     if (!g_logCsInit) { InitializeCriticalSection(&g_logCs); g_logCsInit = true; }
     if (logPath && logPath[0]) strncpy_s(g_logPath, sizeof(g_logPath), logPath, _TRUNCATE);
     if (moduleDir && moduleDir[0]) wcsncpy_s(g_dirW, moduleDir, _TRUNCATE);
     if (!g_dirW[0]) return false;
     if (width <= 0 || height <= 0) return false;
 
+    // Any scale in [25, 100] is allowed: the area-average downscale and the
+    // bilinear upscale do not care about the ratio (2:1 was just the first case
+    // measured). The network size is rounded to even numbers so the 2:1 chroma
+    // relationship stays exact, and anything too small for the feature -- or any
+    // failure at the reduced size -- falls back to native, because a caller that
+    // asked for less work must never end up with no picture at all.
+    int scale = scalePercent;
+    if (scale > 100) scale = 100;
+    if (scale < 25)  scale = 25;
+    int sw = (int)(((long long)width  * scale) / 100) & ~1;
+    int sh = (int)(((long long)height * scale) / 100) & ~1;
+    if (scale == 100 || sw < 256 || sh < 256 || sw > width || sh > height) {
+        if (scale != 100)
+            ELog("scale %d%% -> %dx%d is not usable, staying native", scale, sw, sh);
+        scale = 100; sw = width; sh = height;
+    }
+
     if (!g.dev && !CreateDeviceQueueAndCmd()) return false;
     if (!g.rootSig && !CreateRootSigAndPipelines()) return false;
 
     Shutdown();                                   // drop any previous geometry
     if (!TryInitNgx()) return false;
-    if (!CreateFrameResources(width, height)) return false;
-    if (!CreateFeatureAt(width, height)) return false;
 
+    bool ok = CreateFrameResources(width, height, sw, sh) && CreateFeatureAt(sw, sh);
+    if (!ok && scale != 100) {
+        ELog("engine init at %d%% (%dx%d) failed -> retrying at native %dx%d",
+             scale, sw, sh, width, height);
+        Shutdown();                               // release whatever got half-built
+        scale = 100; sw = width; sh = height;
+        ok = CreateFrameResources(width, height, sw, sh) && CreateFeatureAt(sw, sh);
+    }
+    if (!ok) return false;
+
+    g.scalePct = scale;
     g.ready = true;
-    ELog("engine ready at %dx%d", width, height);
+    ELog("engine ready at %dx%d (network %dx%d, scale %d%%)", width, height, sw, sh, scale);
     return true;
 }
 
@@ -683,8 +887,11 @@ void Shutdown() {
 }
 
 bool Ready()  { return g.ready; }
-int  Width()  { return g.w; }
+int  Width()  { return g.w; }        // the video size, i.e. what ProcessNv12 takes
 int  Height() { return g.h; }
+int  ProcWidth()  { return g.sw; }   // the size the network actually runs at
+int  ProcHeight() { return g.sh; }
+int  ProcScalePercent() { return g.scalePct; }
 
 void SetOptions(const Options& o) {
     g.opt = o;
@@ -706,6 +913,11 @@ bool ProcessNv12(const uint8_t* inY,  int inYStride,
     if (!g.ready || !inY || !inUV || !outY || !outUV) return false;
     const UINT W = (UINT)g.w, H = (UINT)g.h;
     const UINT cw = (UINT)g.cw, ch = (UINT)g.ch;
+    // The size the network runs at. Everything the caller sees stays W x H; when
+    // scaled, only the RGBA working textures, the network and the two conversion
+    // passes shrink (see kSrcNv12ToRgbaScale).
+    const UINT SW = (UINT)g.sw, SH = (UINT)g.sh;
+    const bool scaled = (g.scalePct != 100);
 
     // ---- CPU: stage the two planes into 256-byte-aligned upload buffers ----
     D3D12_RANGE noRead{ 0, 0 };
@@ -722,8 +934,8 @@ bool ProcessNv12(const uint8_t* inY,  int inYStride,
     ID3D12DescriptorHeap* heaps[] = { g.heap };
     g.cmd->SetDescriptorHeaps(1, heaps);
     g.cmd->SetComputeRootSignature(g.rootSig);
-    const UINT dims[2] = { W, H };
-    g.cmd->SetComputeRoot32BitConstants(0, 2, dims, 0);
+    const UINT dims[4] = { W, H, SW, SH };
+    g.cmd->SetComputeRoot32BitConstants(0, 4, dims, 0);
 
     // NV12 planes -> textures
     BarrierOn(g.cmd, g.yTex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -733,14 +945,14 @@ bool ProcessNv12(const uint8_t* inY,  int inYStride,
     CopyToTex(g.cmd, g.uvTex, g.upUV, cw, ch, g.uvPitch, DXGI_FORMAT_R8G8_UNORM);
     BarrierOn(g.cmd, g.uvTex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-    // ---- compute: NV12 -> RGBA8 ----
+    // ---- compute: NV12 -> RGBA8, at the NETWORK size ----
     BarrierOn(g.cmd, g.texIn, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    g.cmd->SetPipelineState(g.psoToRgba);
+    g.cmd->SetPipelineState(scaled ? g.psoToRgbaScale : g.psoToRgba);
     g.cmd->SetComputeRootDescriptorTable(1, DescGpu(0));   // t0 = Y
     g.cmd->SetComputeRootDescriptorTable(2, DescGpu(1));   // t1 = UV
     g.cmd->SetComputeRootDescriptorTable(3, DescGpu(2));   // u0 = texIn
     g.cmd->SetComputeRootDescriptorTable(4, DescGpu(2));   // u1 unused but must exist
-    g.cmd->Dispatch((W + 7) / 8, (H + 7) / 8, 1);
+    g.cmd->Dispatch((SW + 7) / 8, (SH + 7) / 8, 1);   // == (W,H) at 100%
     BarrierOn(g.cmd, g.texIn, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
     // ---- the neural pass ----
@@ -755,20 +967,24 @@ bool ProcessNv12(const uint8_t* inY,  int inYStride,
     g.params->Set("DLSSNR.Reset",  reset ? 1 : 0);
     g.params->Set("DLSSNR.ColorSubrectBaseX", 0u);
     g.params->Set("DLSSNR.ColorSubrectBaseY", 0u);
-    g.params->Set("DLSSNR.ColorSubrectWidth",  W);
-    g.params->Set("DLSSNR.ColorSubrectHeight", H);
+    // The network sees the WHOLE frame -- at its own size. Every subrect is the
+    // network size, not the video size: a subrect that disagrees with the
+    // resources is what produced the old "passes frames through, changes
+    // nothing" bug.
+    g.params->Set("DLSSNR.ColorSubrectWidth",  SW);
+    g.params->Set("DLSSNR.ColorSubrectHeight", SH);
     g.params->Set("DLSSNR.OutputSubrectBaseX", 0u);
     g.params->Set("DLSSNR.OutputSubrectBaseY", 0u);
-    g.params->Set("DLSSNR.OutputSubrectWidth",  W);
-    g.params->Set("DLSSNR.OutputSubrectHeight", H);
+    g.params->Set("DLSSNR.OutputSubrectWidth",  SW);
+    g.params->Set("DLSSNR.OutputSubrectHeight", SH);
     g.params->Set("DLSSNR.MVecSubrectBaseX", 0u);
     g.params->Set("DLSSNR.MVecSubrectBaseY", 0u);
-    g.params->Set("DLSSNR.MVecSubrectWidth",  W);
-    g.params->Set("DLSSNR.MVecSubrectHeight", H);
+    g.params->Set("DLSSNR.MVecSubrectWidth",  SW);
+    g.params->Set("DLSSNR.MVecSubrectHeight", SH);
     g.params->Set("DLSSNR.DepthSubrectBaseX", 0u);
     g.params->Set("DLSSNR.DepthSubrectBaseY", 0u);
-    g.params->Set("DLSSNR.DepthSubrectWidth",  W);
-    g.params->Set("DLSSNR.DepthSubrectHeight", H);
+    g.params->Set("DLSSNR.DepthSubrectWidth",  SW);
+    g.params->Set("DLSSNR.DepthSubrectHeight", SH);
     g.params->Set("DLSSNR.MVecScaleX", 1.0f);
     g.params->Set("DLSSNR.MVecScaleY", 1.0f);
     g.params->Set("DLSSNR.DepthInverted", 1);
@@ -776,7 +992,7 @@ bool ProcessNv12(const uint8_t* inY,  int inYStride,
 
     NVSDK_NGX_Result r = g.fnEval(g.cmd, g.feature, g.params, nullptr);
     if (r != NVSDK_NGX_Result_Success) {
-        ELog("EvaluateFeature 0x%08X at %ux%u", (unsigned)r, W, H);
+        ELog("EvaluateFeature 0x%08X at %ux%u (video %ux%u)", (unsigned)r, SW, SH, W, H);
         g.cmd->Close();
         return false;
     }
@@ -784,10 +1000,13 @@ bool ProcessNv12(const uint8_t* inY,  int inYStride,
     BarrierOn(g.cmd, g.zeroMV,    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     BarrierOn(g.cmd, g.zeroDepth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 
-    // ---- compute: RGBA8 -> NV12 ----
+    // ---- compute: RGBA8 -> NV12, back at the VIDEO size ----
+    // When scaled, these two passes also do the upscale: the luma pass takes a
+    // bilinear tap per output pixel, the chroma pass samples at the chroma
+    // centre (which at 50% lands exactly on one network pixel).
     BarrierOn(g.cmd, g.outYTex,  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     BarrierOn(g.cmd, g.outUVTex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    g.cmd->SetPipelineState(g.psoY);
+    g.cmd->SetPipelineState(scaled ? g.psoYScale : g.psoY);
     // t0 is the NEURAL OUTPUT (slot 8 = SRV texOut). Binding slot 3 here --
     // which is texIn -- silently turns this pass into "convert the input back",
     // i.e. the filter looks like it works and has no effect at all.
@@ -796,7 +1015,7 @@ bool ProcessNv12(const uint8_t* inY,  int inYStride,
     g.cmd->SetComputeRootDescriptorTable(3, DescGpu(4));   // u0 = outY
     g.cmd->SetComputeRootDescriptorTable(4, DescGpu(5));   // u1 = outUV
     g.cmd->Dispatch((W + 7) / 8, (H + 7) / 8, 1);
-    g.cmd->SetPipelineState(g.psoUV);
+    g.cmd->SetPipelineState(scaled ? g.psoUVScale : g.psoUV);
     g.cmd->Dispatch((cw + 7) / 8, (ch + 7) / 8, 1);
     BarrierOn(g.cmd, g.outYTex,  D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     BarrierOn(g.cmd, g.outUVTex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);

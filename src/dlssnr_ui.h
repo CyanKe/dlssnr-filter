@@ -89,6 +89,33 @@ static void DlssNrApply(bool enabled, int style, int pctInt, int pctTone, int pc
     DlssNrIniWriteInt(L"automask",      autoMask ? 1 : 0);
 }
 
+// The late-frame switch. Deliberately NOT part of DlssNrApply(): it is not an
+// NGX parameter, so it never reaches the network -- it only tells the filter's
+// frame policy whether it may refuse frames that can no longer be shown on time
+// (see ShouldDropLateFrame in dlssnr_dshow.cpp). Persistence and logging match
+// the parameter path so it behaves like every other setting.
+static void DlssNrApplyDrop(bool on, bool persist) {
+    Engine::Instance().SetDropFrames(on);
+    if (persist) DlssNrIniWriteInt(L"dropframes", on ? 1 : 0);
+    LogRaw("ui: dropframes = %d", on ? 1 : 0);
+}
+
+// The reduced-resolution switch and its 25..100% slider. Like the drop switch it
+// is not an NGX parameter -- it changes the SIZE of the engine's NGX feature, so
+// applying it re-creates the session (the model stays loaded; ~0.2 s, during
+// which frames pass through). That is also why the slider only applies on
+// TB_ENDTRACK: rebuilding on every tick of a drag would strobe the picture.
+static void DlssNrApplyProcScale(bool enabled, int pct, bool persist) {
+    if (pct < 25)  pct = 25;
+    if (pct > 100) pct = 100;
+    Engine::Instance().SetProcScale(enabled, pct);
+    if (persist) {
+        DlssNrIniWriteInt(L"procenable", enabled ? 1 : 0);
+        DlssNrIniWriteInt(L"procscale",  pct);
+    }
+    LogRaw("ui: procscale = %d%% (enabled=%d)", pct, enabled ? 1 : 0);
+}
+
 // ---------------------------------------------------------------------------
 // settings window
 // ---------------------------------------------------------------------------
@@ -111,11 +138,13 @@ static const wchar_t* T(const wchar_t* zh, const wchar_t* en) {
 }
 
 // Format name from the nominal bytes-per-pixel value the filter publishes
-// (1 = planar YUV 4:2:0, 3 = BGR24, 4 = BGR32).
+// (1 = planar YUV 4:2:0, 3 = BGR24, 4 = BGR32). The engine speaks NV12 end to
+// end since the GPU rewrite -- the old "(converted to BGR24)" wording survived
+// it and only confused the status page.
 static const wchar_t* DlssNrFmtName(int bpp) {
-    if (bpp == 3) return T(L"BGR24（最优）", L"BGR24 (best)");
-    if (bpp == 4) return T(L"BGR32", L"BGR32");
-    if (bpp == 1) return T(L"NV12（内部转 BGR24）", L"NV12 (converted to BGR24)");
+    if (bpp == 1) return T(L"NV12（引擎原生格式）", L"NV12 (engine format)");
+    if (bpp == 3) return T(L"RGB24（引擎不处理，直通）", L"RGB24 (passthrough)");
+    if (bpp == 4) return T(L"RGB32（引擎不处理，直通）", L"RGB32 (passthrough)");
     return T(L"未知", L"unknown");
 }
 
@@ -187,6 +216,14 @@ enum {
     IDC_DLS_ENABLE  = 1100,
     IDC_DLS_AUTOMASK= 1101,
     IDC_DLS_AUTOSHOW= 1102,
+    IDC_DLS_DROP    = 1103,
+    IDC_DLS_PROCCHK = 1104,
+    // The reduced-resolution slider is NOT one of the kDlssNrSliderCount rows:
+    // its range is 25..100 and it re-creates the engine session instead of
+    // pushing an NGX parameter, so it needs its own plumbing.
+    IDC_DLS_PROCLBL = 1130,
+    IDC_DLS_PROCTRK = 1131,
+    IDC_DLS_PROCVAL = 1132,
     // actions
     IDC_DLS_RESETALL= 1110,
     IDC_DLS_RECHECK = 1111,
@@ -206,7 +243,8 @@ struct DlssNrSettings {
     HWND btnClose;                   // borderless header (standalone only)
     HWND tab[3], lang[2], styleBtn[kDlssNrStyleCount];
     HWND lbl[4], trk[4], val[4], rst[4];
-    HWND chkEnable, chkAutoMask, chkAutoshow;
+    HWND chkEnable, chkAutoMask, chkDrop, chkProc, chkAutoshow;
+    HWND lblProc, trkProc, valProc;  // the "processing resolution" row (25..100%)
     HWND btnResetAll, btnRecheck, btnLog;
     HWND lblTitle, lblSub, lblStats, lblGeom, lblHint;
     HFONT font, fontBold, fontBig, fontSmall;
@@ -240,7 +278,7 @@ struct DlssNrMetrics {
     int tabW, langW, styleW;       // segmented buttons
     int   headerH;                   // own title bar (borderless standalone window)
     int   closeW, closeH;            // header close button
-    int   chkW[3];                   // checkbox widths (box + label)
+    int   chkW[5];                   // checkbox widths (box + label)
     int resetAllW, recheckW, logW; // action buttons
     int boxW, thumbW, thumbH, grooveH;
     int titleH;                    // big status title
@@ -256,6 +294,17 @@ static int DlssNrExtent(HDC dc, const wchar_t* s) {
 }
 
 static int DlssNrMax2(int a, int b) { return a > b ? a : b; }
+
+// The late-frame switch's label lives in one place: the layout measures both
+// languages, the checkbox paints it, and the tray menu offers the same thing.
+static const wchar_t* kDlssNrDropZh = L"丢帧保同步";
+static const wchar_t* kDlssNrDropEn = L"Drop late frames";
+
+// The reduced-resolution switch and its slider label.
+static const wchar_t* kDlssNrProcChkZh = L"降分辨率处理";
+static const wchar_t* kDlssNrProcChkEn = L"Reduce resolution";
+static const wchar_t* kDlssNrProcLblZh = L"处理分辨率";
+static const wchar_t* kDlssNrProcLblEn = L"Processing res.";
 
 static const wchar_t* DlssNrStyleNameLang(int i, int lang) {
     static const wchar_t* zh[kDlssNrStyleCount] = { L"默认", L"自然", L"电影", L"风格3" };
@@ -317,6 +366,7 @@ static const DlssNrMetrics& DlssNrGetMetrics() {
     m.lblW = DlssNrMaxExtentLang(dc, L"局部结构", L"Local structure");
     m.lblW = DlssNrMax2(m.lblW, DlssNrMaxExtentLang(dc, L"局部色调", L"Local tone"));
     m.lblW = DlssNrMax2(m.lblW, DlssNrMaxExtentLang(dc, L"皮肤结构", L"Skin structure"));
+    m.lblW = DlssNrMax2(m.lblW, DlssNrMaxExtentLang(dc, kDlssNrProcLblZh, kDlssNrProcLblEn));
     m.lblW += S(8);
 
     m.valW = DlssNrExtent(dc, L"200%") + S(6);
@@ -332,7 +382,9 @@ static const DlssNrMetrics& DlssNrGetMetrics() {
 
     m.chkW[0] = DlssNrMaxExtentLang(dc, L"启用 DLSSNR", L"Enable DLSSNR") + m.boxW + S(10);
     m.chkW[1] = DlssNrMaxExtentLang(dc, L"自动遮罩", L"Automatic mask") + m.boxW + S(10);
-    m.chkW[2] = DlssNrMaxExtentLang(dc, L"启动时显示控制面板", L"Show panel on playback")
+    m.chkW[2] = DlssNrMaxExtentLang(dc, kDlssNrDropZh, kDlssNrDropEn) + m.boxW + S(10);
+    m.chkW[3] = DlssNrMaxExtentLang(dc, kDlssNrProcChkZh, kDlssNrProcChkEn) + m.boxW + S(10);
+    m.chkW[4] = DlssNrMaxExtentLang(dc, L"启动时显示控制面板", L"Show panel on playback")
               + m.boxW + S(10);
     m.resetAllW = DlssNrMaxExtentLang(dc, L"重置为默认", L"Reset defaults") + S(18);
     m.recheckW  = DlssNrMaxExtentLang(dc, L"重新检测", L"Recheck") + S(18);
@@ -345,8 +397,11 @@ static const DlssNrMetrics& DlssNrGetMetrics() {
     const int styleRowW = m.margin * 2 + m.lblW + m.gap
         + kDlssNrStyleCount * m.styleW + (kDlssNrStyleCount - 1) * m.btnGap;
     if (styleRowW > m.wantW) m.wantW = styleRowW;
-    const int chkRowW = m.margin * 2 + m.chkW[0] + m.chkW[1] + m.chkW[2] + 2 * m.gap;
-    if (chkRowW > m.wantW) m.wantW = chkRowW;
+    // Two rows of checkboxes: (enable, mask, drop frames) then (resolution, autoshow).
+    const int chkRow1W = m.margin * 2 + m.chkW[0] + m.chkW[1] + m.chkW[2] + 2 * m.gap;
+    const int chkRow2W = m.margin * 2 + m.chkW[3] + m.chkW[4] + m.gap;
+    if (chkRow1W > m.wantW) m.wantW = chkRow1W;
+    if (chkRow2W > m.wantW) m.wantW = chkRow2W;
     const int actionRowW = m.margin * 2 + m.resetAllW + m.recheckW + m.logW + 4 * m.gap;
     if (actionRowW > m.wantW) m.wantW = actionRowW;
 
@@ -354,8 +409,10 @@ static const DlssNrMetrics& DlssNrGetMetrics() {
     const int hintW = m.wantW - 2 * m.margin;
     m.hintH = 0;
     {
-        static const wchar_t* zh = L"参数实时生效；取消勾选「启用 DLSSNR」为真正的直通。";
-        static const wchar_t* en = L"Live: uncheck Enable DLSSNR for a true pass-through.";
+        static const wchar_t* zh = L"参数实时生效；取消勾选「启用 DLSSNR」为真正的直通。"
+                                    L"引擎跟不上时，可勾「丢帧保同步」或「降分辨率处理」。";
+        static const wchar_t* en = L"Live: uncheck Enable DLSSNR for a true pass-through. "
+                                    L"If the engine cannot keep up, use Drop late frames or Reduce resolution.";
         for (int lang = 0; lang < 2; ++lang) {
             RECT rc = { 0, 0, hintW, 0 };
             DrawTextW(dc, lang ? en : zh, -1, &rc,
@@ -366,8 +423,8 @@ static const DlssNrMetrics& DlssNrGetMetrics() {
     }
 
     const int paramsH = m.segH + m.gap                                  // style row
-                      + kDlssNrSliderCount * m.rowPitch                 // sliders
-                      + m.gap + m.rowH                                  // checkboxes
+                      + (kDlssNrSliderCount + 1) * m.rowPitch           // sliders + processing res.
+                      + m.gap + 2 * m.rowH + m.gap / 2                  // two rows of checkboxes
                       + m.gap + m.segH                                  // actions
                       + m.gap + m.hintH;                                // hint
     const int statusH = m.titleH + m.gap + 3 * m.lineH + 2 * S(4);
@@ -649,11 +706,26 @@ static void DlssNrLayout(DlssNrSettings* s) {
         MoveWindow(s->val[i], cx, ry, m.valW, m.rowH, TRUE);          cx += m.valW + m.gap;
         MoveWindow(s->rst[i], cx, ry, m.rstW, m.rowH, TRUE);
     }
-    y = rowTop + kDlssNrSliderCount * m.rowPitch + m.gap;
+    // The processing-resolution row: label / slider / readout. No Reset button --
+    // 100% IS the reset, and it is where switching the feature off sits.
+    {
+        const int ry = rowTop + kDlssNrSliderCount * m.rowPitch + (m.rowPitch - m.rowH) / 2;
+        int cx = x0;
+        MoveWindow(s->lblProc, cx, ry, m.lblW, m.rowH, TRUE);  cx += m.lblW + m.gap;
+        MoveWindow(s->trkProc, cx, ry, m.barW, m.rowH, TRUE);  cx += m.barW + m.gap;
+        MoveWindow(s->valProc, cx, ry, m.valW + m.gap + m.rstW, m.rowH, TRUE);
+    }
+    y = rowTop + (kDlssNrSliderCount + 1) * m.rowPitch + m.gap;
 
-    HWND checks[3] = { s->chkEnable, s->chkAutoMask, s->chkAutoshow };
-    x = x0;
+    HWND checks[5] = { s->chkEnable, s->chkAutoMask, s->chkDrop, s->chkProc, s->chkAutoshow };
+    x = x0;                                   // row 1: what the picture looks like
     for (int i = 0; i < 3; ++i) {
+        MoveWindow(checks[i], x, y, m.chkW[i], m.rowH, TRUE);
+        x += m.chkW[i] + m.gap;
+    }
+    y += m.rowH + m.gap / 2;                  // row 2: resolution + panel prefs
+    x = x0;
+    for (int i = 3; i < 5; ++i) {
         MoveWindow(checks[i], x, y, m.chkW[i], m.rowH, TRUE);
         x += m.chkW[i] + m.gap;
     }
@@ -687,6 +759,12 @@ static void DlssNrLayout(DlssNrSettings* s) {
         ShowWindow(s->val[i], show);
         ShowWindow(s->rst[i], show);
     }
+    // The processing-resolution row belongs to the parameter page too (and to the
+    // compare page, which shares it). Missing these three lines is how it ended up
+    // drawn on the STATUS page, in the middle of the telemetry.
+    ShowWindow(s->lblProc, show);
+    ShowWindow(s->trkProc, show);
+    ShowWindow(s->valProc, show);
     for (HWND h : checks) ShowWindow(h, show);
     ShowWindow(s->btnResetAll, show);
     ShowWindow(s->btnRecheck, show);
@@ -703,8 +781,10 @@ static void DlssNrLayout(DlssNrSettings* s) {
 static COLORREF g_statusColour = RGB(0x96, 0x96, 0x96);
 
 static const wchar_t* DlssNrHintText() {
-    return T(L"参数实时生效；取消勾选「启用 DLSSNR」为真正的直通。",
-             L"Live: uncheck Enable DLSSNR for a true pass-through.");
+    return T(L"参数实时生效；取消勾选「启用 DLSSNR」为真正的直通。"
+             L"引擎跟不上时，可勾「丢帧保同步」或「降分辨率处理」。",
+             L"Live: uncheck Enable DLSSNR for a true pass-through. "
+             L"If the engine cannot keep up, use Drop late frames or Reduce resolution.");
 }
 
 // Defined with the compare window further down; the panel re-titles that window on a
@@ -720,6 +800,7 @@ static void DlssNrRetext(HWND hwnd) {
     SetWindowTextW(s->lbl[1], T(L"局部色调", L"Local tone"));
     SetWindowTextW(s->lbl[2], T(L"局部结构", L"Local structure"));
     SetWindowTextW(s->lbl[3], T(L"皮肤结构", L"Skin structure"));
+    SetWindowTextW(s->lblProc, T(kDlssNrProcLblZh, kDlssNrProcLblEn));
     SetWindowTextW(s->lblHint, DlssNrHintText());
     if (s->compareWnd) {
         SetWindowTextW(s->compareWnd, DlssNrCompareTitle());
@@ -739,6 +820,8 @@ static const wchar_t* DlssNrButtonLabel(int id) {
     case IDC_DLS_ENABLE:    return T(L"启用 DLSSNR", L"Enable DLSSNR");
     case IDC_DLS_AUTOMASK:  return T(L"自动遮罩", L"Automatic mask");
     case IDC_DLS_AUTOSHOW:  return T(L"启动时显示控制面板", L"Show panel on playback");
+    case IDC_DLS_DROP:      return T(kDlssNrDropZh, kDlssNrDropEn);
+    case IDC_DLS_PROCCHK:   return T(kDlssNrProcChkZh, kDlssNrProcChkEn);
     case IDC_DLS_RESETALL:  return T(L"重置为默认", L"Reset defaults");
     case IDC_DLS_RECHECK:   return T(L"重新检测", L"Recheck");
     case IDC_DLS_LOG:       return T(L"打开日志", L"Open log");
@@ -789,18 +872,29 @@ static void DlssNrRefreshStatus(HWND hwnd) {
     SetWindowTextW(s->lblSub, buf);
 
     const int seen = (int)sh->framesSeen, proc = (int)sh->framesProcessed;
+    // "dropped" is the late-frame policy's own counter (see ShouldDropLateFrame):
+    // frames the engine was too slow for, and that would only have pushed the
+    // picture further behind the sound. Frames are counted cumulatively for the
+    // whole process, so a running percentage lives in tools\read_telemetry.py.
     _snwprintf_s(buf, _countof(buf), _TRUNCATE,
-                 T(L"帧: 收到 %d / 处理 %d / 直通 %d  (处理率 %.1f%%)    引擎 %s    %.2f ms/帧",
-                   L"Frames: seen %d / processed %d / passthrough %d  (%.1f%%)    engine %s    %.2f ms/frame"),
-                 seen, proc, (int)sh->framesPassthrough,
-                 seen ? (100.0 * proc / seen) : 0.0, eng, (double)sh->lastProcessMs);
+                 T(L"帧: 收到 %d / 处理 %d / 直通 %d / 丢帧 %d    引擎 %s    %.2f ms/帧",
+                   L"Frames: seen %d / processed %d / passthrough %d / dropped %d    engine %s    %.2f ms/frame"),
+                 seen, proc, (int)sh->framesPassthrough, (int)sh->framesDropped,
+                 eng, (double)sh->lastProcessMs);
     SetWindowTextW(s->lblStats, buf);
 
+    // "engine session" IS the processing size now, so show the applied
+    // percentage with it -- that is how a fallback (asked for 25%, got native
+    // because the size was not usable) becomes visible instead of silent.
+    Engine& en = Engine::Instance();
+    const int pct = en.Ready() ? en.AppliedScale() : en.ProcScalePct();
+    const int pw  = en.Ready() ? en.AppliedW() : 0;
+    const int ph2 = en.Ready() ? en.AppliedH() : 0;
     _snwprintf_s(buf, _countof(buf), _TRUNCATE,
-                 T(L"视频 %dx%d    像素格式 %s    引擎会话 %dx%d",
-                   L"Video %dx%d    format %s    engine session %dx%d"),
+                 T(L"视频 %dx%d    %s    处理 %d%% (%dx%d)    滞后 %.1f ms",
+                   L"Video %dx%d    %s    proc %d%% (%dx%d)    lag %.1f ms"),
                  (int)sh->videoW, (int)sh->videoH, DlssNrFmtName((int)sh->inputBpp),
-                 (int)sh->engineW, (int)sh->engineH);
+                 pct, pw, ph2, (double)sh->dropLagMs);
     SetWindowTextW(s->lblGeom, buf);
 }
 
@@ -810,6 +904,18 @@ static void DlssNrRefreshControls(HWND hwnd) {
     Engine& e = Engine::Instance();
     DlssNrSetChecked(s->chkEnable, e.OptEnabled());
     DlssNrSetChecked(s->chkAutoMask, e.OptAutoMask());
+    DlssNrSetChecked(s->chkDrop, e.OptDropFrames());
+    DlssNrSetChecked(s->chkProc, e.OptProcEnabled());
+    // The slider keeps its position while the switch is off (that is the value
+    // the panel restores), but it is not editable until the switch is on.
+    EnableWindow(s->trkProc, e.OptProcEnabled() ? TRUE : FALSE);
+    SendMessageW(s->trkProc, TBM_SETPOS, TRUE, e.OptProcScale());
+    {
+        wchar_t t[16];
+        _snwprintf_s(t, _countof(t), _TRUNCATE, L"%d%%", e.OptProcScale());
+        SetWindowTextW(s->valProc, t);
+        InvalidateRect(s->trkProc, nullptr, FALSE);
+    }
     DlssNrSetChecked(s->chkAutoshow, DlssNrAutoshow());
     const float v[kDlssNrSliderCount] = {
         e.OptIntensity(), e.OptTone(), e.OptStruct(), e.OptSkin() };
@@ -1164,12 +1270,32 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             s->rst[i] = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                         0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)(base + 3), g_hModule, nullptr);
         }
+        // The reduced-resolution row: same columns as a slider row, but its own
+        // range (25..100%) and its own handler -- changing it re-creates the
+        // engine's NGX session instead of pushing a parameter.
+        s->lblProc = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                     0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_PROCLBL, g_hModule, nullptr);
+        s->trkProc = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
+                                     0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_PROCTRK, g_hModule, nullptr);
+        SendMessageW(s->trkProc, TBM_SETRANGE, TRUE, MAKELPARAM(25, 100));
+        SendMessageW(s->trkProc, TBM_SETLINESIZE, 0, 5);
+        SendMessageW(s->trkProc, TBM_SETPAGESIZE, 0, 5);
+        SetWindowSubclass(s->trkProc, DlssNrSliderProc, 0, 0);
+        s->valProc = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_RIGHT,
+                                     0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_PROCVAL, g_hModule, nullptr);
         s->chkEnable = CreateWindowExW(0, L"BUTTON", L"",
                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                                        0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_ENABLE, g_hModule, nullptr);
         s->chkAutoMask = CreateWindowExW(0, L"BUTTON", L"",
                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                                          0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_AUTOMASK, g_hModule, nullptr);
+        s->chkDrop = CreateWindowExW(0, L"BUTTON", L"",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                     0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_DROP, g_hModule, nullptr);
+        s->chkProc = CreateWindowExW(0, L"BUTTON", L"",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                     0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_PROCCHK, g_hModule, nullptr);
         s->chkAutoshow = CreateWindowExW(0, L"BUTTON", L"",
                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                                          0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_AUTOSHOW, g_hModule, nullptr);
@@ -1206,7 +1332,8 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                        s->lbl[1], s->trk[1], s->val[1], s->rst[1],
                        s->lbl[2], s->trk[2], s->val[2], s->rst[2],
                        s->lbl[3], s->trk[3], s->val[3], s->rst[3],
-                       s->chkEnable, s->chkAutoMask, s->chkAutoshow,
+                       s->chkEnable, s->chkAutoMask, s->chkDrop, s->chkProc, s->chkAutoshow,
+                       s->lblProc, s->trkProc, s->valProc,
                        s->btnResetAll, s->btnRecheck, s->btnLog,
                        s->lblTitle, s->lblSub, s->lblStats, s->lblGeom, s->lblHint };
         for (HWND h : all) if (h) SendMessageW(h, WM_SETFONT, (WPARAM)s->font, TRUE);
@@ -1219,11 +1346,13 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(s->styleBtn[i], WM_SETFONT, (WPARAM)s->fontBold, TRUE);
         for (int i = 0; i < kDlssNrSliderCount; ++i)
             SendMessageW(s->lbl[i], WM_SETFONT, (WPARAM)s->fontBold, TRUE);
+        // the processing-resolution row is a slider row too, so its label is bold
+        SendMessageW(s->lblProc, WM_SETFONT, (WPARAM)s->fontBold, TRUE);
         SendMessageW(s->lblTitle, WM_SETFONT, (WPARAM)s->fontBig, TRUE);
         // Plain array, not an initializer_list range-for: this header must
         // compile in a translation unit that does not include <initializer_list>.
         HWND smallType[] = { s->lblSub, s->lblStats, s->lblGeom, s->lblHint,
-                             s->val[0], s->val[1], s->val[2], s->val[3] };
+                             s->val[0], s->val[1], s->val[2], s->val[3], s->valProc };
         for (HWND h : smallType) SendMessageW(h, WM_SETFONT, (WPARAM)s->fontSmall, TRUE);
 
         DlssNrAttachHover(s->tab[0]);   DlssNrAttachHover(s->tab[1]);
@@ -1240,6 +1369,8 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Checkboxes are real checkboxes that paint themselves (see DlssNrCheckProc).
         SetWindowSubclass(s->chkEnable,   DlssNrCheckProc, 1, 0);
         SetWindowSubclass(s->chkAutoMask, DlssNrCheckProc, 1, 0);
+        SetWindowSubclass(s->chkDrop,     DlssNrCheckProc, 1, 0);
+        SetWindowSubclass(s->chkProc,     DlssNrCheckProc, 1, 0);
         SetWindowSubclass(s->chkAutoshow, DlssNrCheckProc, 1, 0);
 
         s->page = 0;
@@ -1348,6 +1479,8 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         Engine& e = Engine::Instance();
         DlssNrSetChecked(s->chkEnable, e.OptEnabled());
         DlssNrSetChecked(s->chkAutoMask, e.OptAutoMask());
+        DlssNrSetChecked(s->chkDrop, e.OptDropFrames());   // the tray can change it
+        DlssNrSetChecked(s->chkProc, e.OptProcEnabled());
         DlssNrSetChecked(s->chkAutoshow, DlssNrAutoshow());
         if (s->shownStyle != e.OptStyle()) {       // the tray menu can change it too
             s->shownStyle = e.OptStyle();
@@ -1361,6 +1494,18 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_HSCROLL: {
         if (!s) break;
         HWND from = (HWND)lp;
+        if (from == s->trkProc) {
+            // Readout live, rebuild only when the drag ends: every change
+            // re-creates the NGX session, which briefly passes frames through.
+            const int pct = (int)SendMessageW(from, TBM_GETPOS, 0, 0);
+            wchar_t t[16];
+            _snwprintf_s(t, _countof(t), _TRUNCATE, L"%d%%", pct);
+            SetWindowTextW(s->valProc, t);
+            InvalidateRect(from, nullptr, FALSE);
+            if (LOWORD(wp) == TB_ENDTRACK)
+                DlssNrApplyProcScale(DlssNrChecked(s->chkProc), pct, true);
+            return 0;
+        }
         int idx = -1;
         for (int i = 0; i < kDlssNrSliderCount; ++i) if (from == s->trk[i]) idx = i;
         if (idx < 0) break;
@@ -1426,6 +1571,16 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DlssNrPush(hwnd, true);
             return 0;
         }
+        if (id == IDC_DLS_DROP) {
+            DlssNrApplyDrop(DlssNrChecked(s->chkDrop), true);
+            return 0;
+        }
+        if (id == IDC_DLS_PROCCHK) {
+            const int pct = (int)SendMessageW(s->trkProc, TBM_GETPOS, 0, 0);
+            DlssNrApplyProcScale(DlssNrChecked(s->chkProc), pct, true);
+            DlssNrRefreshControls(hwnd);      // greys the slider out when it is off
+            return 0;
+        }
         if (id == IDC_DLS_AUTOSHOW) {
             const bool now = DlssNrChecked(s->chkAutoshow);
             DlssNrIniWriteInt(L"autoshow", now ? 1 : 0);
@@ -1437,6 +1592,11 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         kDlssNrSliderDef[2], kDlssNrSliderDef[3], false, true);
             DlssNrSetChecked(s->chkEnable, true);
             DlssNrSetChecked(s->chkAutoMask, false);
+            DlssNrSetChecked(s->chkDrop, true);       // dropping is the default
+            DlssNrApplyDrop(true, true);
+            DlssNrSetChecked(s->chkProc, false);      // reduced resolution is opt-in
+            SendMessageW(s->trkProc, TBM_SETPOS, TRUE, 50);
+            DlssNrApplyProcScale(false, 50, true);    // 50% = the value it restores to
             DlssNrRefreshControls(hwnd);
             if (s->onChanged) s->onChanged(s->onChangedCtx);
             HWND par = GetParent(hwnd);
@@ -1624,6 +1784,7 @@ enum {
     IDM_DLS_ABOUT    = 4,
     IDM_DLS_HIDE     = 5,
     IDM_DLS_AUTOSHOW = 6,
+    IDM_DLS_DROP     = 7,
     IDM_DLS_STYLE    = 100,     // +0..3
     IDM_DLS_INT      = 200,     // +0..4
     IDM_DLS_TONE     = 300,     // +0..4
@@ -1866,6 +2027,8 @@ private:
                         kDlssNrPct200, kDlssNrPctCount);
         AppendMenuW(m, MF_STRING | (e.OptAutoMask() ? MF_CHECKED : 0), IDM_DLS_AUTOMASK,
                     T(L"自动遮罩", L"Automatic mask"));
+        AppendMenuW(m, MF_STRING | (e.OptDropFrames() ? MF_CHECKED : 0), IDM_DLS_DROP,
+                    T(kDlssNrDropZh, kDlssNrDropEn));
 
         AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(m, MF_STRING, IDM_DLS_SETTINGS, T(L"打开控制面板…", L"Open control panel…"));
@@ -1890,6 +2053,7 @@ private:
         Engine& e = Engine::Instance();
         if (cmd == IDM_DLS_ENABLE)  { DlssNrApply(!e.OptEnabled(), e.OptStyle(), Pct(e.OptIntensity()), Pct(e.OptTone()), Pct(e.OptStruct()), Pct(e.OptSkin()), e.OptAutoMask(), true); UpdateTip(); return; }
         if (cmd == IDM_DLS_AUTOMASK){ DlssNrApply(e.OptEnabled(), e.OptStyle(), Pct(e.OptIntensity()), Pct(e.OptTone()), Pct(e.OptStruct()), Pct(e.OptSkin()), !e.OptAutoMask(), true); return; }
+        if (cmd == IDM_DLS_DROP)    { DlssNrApplyDrop(!e.OptDropFrames(), true); return; }
         if (cmd == IDM_DLS_SETTINGS){ OpenSettings(); return; }
         if (cmd == IDM_DLS_AUTOSHOW) {
             bool now = !DlssNrAutoshow();

@@ -121,7 +121,11 @@ static void LogRaw(const char* fmt, ...) {
 // All four DLSSNR parameters were measured to take effect mid-session without
 // re-creating the feature, so no restart is needed when they change.
 // ---------------------------------------------------------------------------
-static const wchar_t* kSharedName = L"Local\\DLSSNR_DShow_Shared_v1";
+// _v2 because the layout grew (the late-frame counters). Sharing one mapping
+// name with an older build would mean either side mapping a view smaller than
+// the struct it dereferences -- i.e. an access violation inside the player --
+// so a new field block gets a new name instead of a version check.
+static const wchar_t* kSharedName = L"Local\\DLSSNR_DShow_Shared_v2";
 static const unsigned int kSharedMagic = 0x4E534C44;   // 'DLSN'
 
 #pragma pack(push, 1)
@@ -159,8 +163,27 @@ struct SharedState {
     volatile float reqLocalTone;    // 0..1
     volatile float reqLocalStruct;  // 0..1
     volatile float reqMix;          // reserved
+
+    // ---- late-frame policy ----
+    // Appended at the END on purpose: every field above keeps the offset it had,
+    // so a reader that stops early still reads a valid prefix.
+    volatile long  framesDropped;  // frames discarded because they were late
+    volatile int   dropEnabled;    // the switch, as currently in effect
+    volatile float dropPct;        // framesDropped / framesSeen, 0..100
+    volatile float dropLagMs;      // lateness measured at the last decision
 };
 #pragma pack(pop)
+
+// tools\read_telemetry.py reads this struct as raw bytes at fixed offsets, so a
+// silent layout change would make it print another field's value. Pin the
+// offsets: adding a field means touching the mapping name above, this list and
+// the constants in that script, all on purpose.
+static_assert(sizeof(SharedState) == 380,                "update tools\\read_telemetry.py");
+static_assert(offsetof(SharedState, status)       == 80, "update tools\\read_telemetry.py");
+static_assert(offsetof(SharedState, framesDropped) == 364, "update tools\\read_telemetry.py");
+static_assert(offsetof(SharedState, dropEnabled)   == 368, "update tools\\read_telemetry.py");
+static_assert(offsetof(SharedState, dropPct)       == 372, "update tools\\read_telemetry.py");
+static_assert(offsetof(SharedState, dropLagMs)     == 376, "update tools\\read_telemetry.py");
 
 // pass-through reason codes (mirrored by the panel)
 enum {
@@ -195,7 +218,7 @@ static void OpenShared() {
     if (g_shared->magic != kSharedMagic) {
         ZeroMemory((void*)g_shared, sizeof(SharedState));
         g_shared->magic = kSharedMagic;
-        g_shared->version = 1;
+        g_shared->version = 2;
         g_shared->structSize = (unsigned int)sizeof(SharedState);
         // sensible defaults for the requested block
         g_shared->reqEnabled = 1;
@@ -423,6 +446,22 @@ struct Config {
     float skinStruct;    // 0..2, 0 = off (same range/default as Magpie's
                          //   DLSSNR "Skin Structure Strength")
     bool  autoMask;      // DLSSNR.UseAutoMask
+    // Late-frame policy. At 4K60 the engine needs 34 ms for a 16.7 ms budget,
+    // so "process every frame" cannot work: the video branch advances at ~29 fps
+    // while the audio follows the reference clock, and the difference ACCUMULATES
+    // into a growing A/V offset (the picture looks like slow motion). Dropping
+    // the frames that can no longer be delivered on time keeps the offset
+    // constant instead. See ShouldDropLateFrame() in the filter.
+    bool  dropFrames;    // "dropframes": 0 = never drop (old behaviour, drifts)
+    int   maxLagMs;      // "maxlagms":   0 = auto (one frame interval)
+    // Reduced-resolution processing: run the network on a smaller frame and
+    // upscale its output. Buys real speed (4K60: 34.7 ms -> ~12 ms at 50%) and
+    // costs real quality (it is softer, and pre-smoothing the frame before the
+    // network stops it denoising -- see docs\ENGINEERING_NOTES.md section 8), so
+    // it is off by default and lives behind its own switch. procScale is the
+    // slider position and is remembered while the switch is off.
+    bool  procEnabled;   // "procenable"
+    int   procScale;     // "procscale": 25..100, percent of the video size
 };
 
 static Config ReadConfig() {
@@ -434,6 +473,11 @@ static Config ReadConfig() {
     c.localStruct = 1.0f;
     c.skinStruct  = 0.0f;
     c.autoMask    = false;
+    c.dropFrames  = true;      // on by default: without it an overloaded engine
+    c.maxLagMs    = 0;         // drifts out of sync instead of dropping frames
+    c.procEnabled = false;     // reduced resolution is opt-in: it trades picture
+    c.procScale   = 50;        // quality for frame rate, and 50% is the point that
+                               // makes 4K60 fit (See ENGINEERING_NOTES 8)
 
     wchar_t ini[MAX_PATH];
     _snwprintf_s(ini, _countof(ini), _TRUNCATE, L"%s\\%s", g_dir, kIniName);
@@ -454,6 +498,14 @@ static Config ReadConfig() {
     c.localStruct = (float)(iStruct < 0 ? 0 : (iStruct > 200 ? 200 : iStruct)) / 100.0f;
     c.skinStruct  = (float)(iSkin   < 0 ? 0 : (iSkin   > 200 ? 200 : iSkin))   / 100.0f;
     c.autoMask    = GetPrivateProfileIntW(L"DLSSNR", L"automask", 0, ini) != 0;
+    c.dropFrames  = GetPrivateProfileIntW(L"DLSSNR", L"dropframes", 1, ini) != 0;
+    int iLag      = GetPrivateProfileIntW(L"DLSSNR", L"maxlagms", 0, ini);
+    // 0 = auto (= one frame interval). The cap keeps a hand-edited ini from
+    // telling the policy to accept a multi-second offset.
+    c.maxLagMs    = iLag < 0 ? 0 : (iLag > 500 ? 500 : iLag);
+    c.procEnabled = GetPrivateProfileIntW(L"DLSSNR", L"procenable", 0, ini) != 0;
+    int iProc     = GetPrivateProfileIntW(L"DLSSNR", L"procscale", 50, ini);
+    c.procScale   = iProc < 25 ? 25 : (iProc > 100 ? 100 : iProc);
     return c;
 }
 
@@ -479,6 +531,26 @@ static float ClampRange(float v, float lo, float hi, float fallback) {
     if (v < lo) return lo;
     if (v > hi) return hi;
     return v;
+}
+
+// One frame period, in 100 ns REFERENCE_TIME ticks. Used by the late-frame
+// policy as the yardstick for "this frame has slipped a whole frame behind".
+// AvgTimePerFrame is the honest source when the stream declares one, but it is
+// 0 for VFR and for some decoders' output, so there is a 60 fps fallback and the
+// policy also measures the intervals it actually sees.
+static const REFERENCE_TIME kFallbackFrameInterval = 166667;   // 1/60 s
+
+static REFERENCE_TIME FrameIntervalOf(const AM_MEDIA_TYPE* pmt) {
+    REFERENCE_TIME iv = 0;
+    if (pmt && pmt->pbFormat) {
+        if (pmt->formattype == FORMAT_VideoInfo && pmt->cbFormat >= sizeof(VIDEOINFOHEADER))
+            iv = ((const VIDEOINFOHEADER*)pmt->pbFormat)->AvgTimePerFrame;
+        else if (pmt->formattype == FORMAT_VideoInfo2 && pmt->cbFormat >= sizeof(VIDEOINFOHEADER2))
+            iv = ((const VIDEOINFOHEADER2*)pmt->pbFormat)->AvgTimePerFrame;
+    }
+    // 0 = unknown/VFR; anything under 1 ms (1000 fps) is nonsense, not a stream.
+    if (iv < 10000) iv = kFallbackFrameInterval;
+    return iv;
 }
 
 // ---------------------------------------------------------------------------
@@ -573,6 +645,7 @@ public:
     void RequestInit(int w, int h) {
         InterlockedExchange(&m_wantW, (LONG)w);
         InterlockedExchange(&m_wantH, (LONG)h);
+        InterlockedExchange(&m_wantScale, (LONG)ProcScalePct());
         if (m_evtWake) SetEvent(m_evtWake);
     }
 
@@ -592,16 +665,58 @@ public:
     bool  OptEnabled()   { return m_optEnabled; }
     bool  OptSeeded()    { return m_seeded; }
 
+    // ---- late-frame policy ----
+    // A playback behaviour, not an NGX parameter: it never goes into
+    // dlssnr::Options and never gets pushed to the network. It lives here (rather
+    // than in Config) because this object, not the ini snapshot, is what the
+    // control panel and the tray menu can change while a file is playing.
+    bool  OptDropFrames() { return m_optDropFrames; }
+    int   OptMaxLagMs()   { return m_optMaxLagMs; }
+    void  SetDropFrames(bool on) { m_optDropFrames = on; }
+
+    // ---- reduced-resolution processing ----
+    // Also not an NGX parameter: it changes the SIZE of the NGX feature, so
+    // switching it means re-creating the session (fast -- the model stays loaded;
+    // measured ~0.2 s). ProcScalePct() is what the engine was asked for
+    // (effective: 100 while the switch is off), Applied* is what it ended up
+    // with, which can differ when the reduced size is not usable.
+    bool  OptProcEnabled() { return m_optProcEnabled; }
+    int   OptProcScale()   { return m_optProcScale; }        // slider position
+    int   ProcScalePct()   { return m_optProcEnabled ? m_optProcScale : 100; }
+    int   Scale()          { return m_scale; }               // session was built for
+    int   AppliedScale()   { return m_appliedScale; }
+    int   AppliedW()       { return dlssnr::ProcWidth(); }
+    int   AppliedH()       { return dlssnr::ProcHeight(); }
+
+    void SetProcScale(bool enabled, int pct) {
+        if (pct < 25)   pct = 25;
+        if (pct > 100)  pct = 100;
+        const int before = ProcScalePct();
+        m_optProcEnabled = enabled;
+        m_optProcScale   = pct;
+        if (ProcScalePct() == before) return;      // nothing to rebuild
+        // Re-creating the session needs the video geometry, which only the
+        // worker's pending request knows; RequestInit() picks it up from there.
+        RequestInit((int)m_w, (int)m_h);
+    }
+
     // The ini is only the STARTING point. Because this engine lives for the
     // whole process, re-reading the ini on every new filter instance would
     // revert a change the user just made in the control panel, so seed once.
     void SeedOptionsOnce(bool enabled, int style, float intensity, float tone,
-                         float strct, float skin, bool autoMask) {
+                         float strct, float skin, bool autoMask,
+                         bool dropFrames, int maxLagMs,
+                         bool procEnabled, int procScale) {
         EnterCriticalSection(&m_lock);
         bool first = !m_seeded;
         m_seeded = true;
         LeaveCriticalSection(&m_lock);
-        if (first) SetOptions(enabled, style, intensity, tone, strct, skin, autoMask);
+        if (!first) return;
+        SetOptions(enabled, style, intensity, tone, strct, skin, autoMask);
+        m_optDropFrames  = dropFrames;
+        m_optMaxLagMs    = maxLagMs;
+        m_optProcEnabled = procEnabled;
+        if (procScale >= 25 && procScale <= 100) m_optProcScale = procScale;
     }
     dlssnr::Options Opts() const {
         dlssnr::Options o;
@@ -689,11 +804,12 @@ private:
     void Run() {
         for (;;) {
             if (m_quit) return;
-            int w, h;
+            int w, h, scale;
             EnterCriticalSection(&m_lock);
             if (InterlockedExchange(&m_sessionReset, 0)) ApplySessionReset();
-            w = (int)m_wantW; h = (int)m_wantH;
-            bool needInit = (w > 0 && h > 0) && !(m_ready && m_w == w && m_h == h);
+            w = (int)m_wantW; h = (int)m_wantH; scale = (int)m_wantScale;
+            bool needInit = (w > 0 && h > 0) &&
+                            !(m_ready && m_w == w && m_h == h && m_scale == scale);
             LeaveCriticalSection(&m_lock);
 
             if (needInit) {
@@ -751,20 +867,29 @@ private:
         }
         dlssnr::SetOptions(Opts());
         m_optDirty = false;
-        const bool ok = dlssnr::Init(w, h, g_dir, log);
+        const int wantScale = (int)m_wantScale;
+        const bool ok = dlssnr::Init(w, h, g_dir, log, wantScale);
         if (ok) {
             m_w = dlssnr::Width();
             m_h = dlssnr::Height();
+            // Record what we ASKED for, not what came back: a reduced size that
+            // is not usable falls back to native inside the engine, and storing
+            // the applied value here would make the worker re-init for ever.
+            m_scale        = wantScale;
+            m_appliedScale = dlssnr::ProcScalePercent();
             m_ready = true;
             m_failed = false;
         }
         LeaveCriticalSection(&m_lock);
 
         if (!ok) {
-            LogRaw("engine: init FAILED %dx%d -> staying in passthrough", w, h);
+            LogRaw("engine: init FAILED %dx%d at %d%% -> staying in passthrough",
+                   w, h, wantScale);
             return;   // keep thread alive; a later type change may succeed
         }
-        LogRaw("engine: READY %dx%d", m_w, m_h);
+        LogRaw("engine: READY %dx%d, network %dx%d (%d%% asked, %d%% applied)",
+               m_w, m_h, dlssnr::ProcWidth(), dlssnr::ProcHeight(),
+               wantScale, m_appliedScale);
         // The UI is the tray icon, which owns its own thread and opens the
         // native control panel; nothing to launch from here (and no Python).
     }
@@ -772,10 +897,16 @@ private:
     volatile bool m_ready;
     volatile bool m_failed;
     int          m_w, m_h;
+    int          m_scale = 100;          // what this session was built for
+    int          m_appliedScale = 100;   // what the engine actually used
     HANDLE       m_thread;
     // Requested geometry. Written from graph threads with InterlockedExchange
     // (never under m_lock) and read by the worker; aligned 32-bit accesses.
     volatile LONG m_wantW = 0, m_wantH = 0;
+    // The network scale THIS session was created for (100 = native). Kept apart
+    // from the applied value so a fallback to native does not look like a
+    // mismatch that needs re-initialising.
+    volatile LONG m_wantScale = 100;
     HANDLE       m_evtWake;
     volatile bool m_quit;
     CRITICAL_SECTION m_lock;
@@ -793,6 +924,10 @@ private:
     float m_optIntensity = 1.0f, m_optTone = 1.0f, m_optStrct = 1.0f;
     float m_optSkin = 0.0f;              // 0..2 (0 = off)
     bool  m_optAutoMask = false;
+    bool  m_optDropFrames = true;        // late-frame policy switch
+    int   m_optMaxLagMs   = 0;           // 0 = auto (one frame interval)
+    bool  m_optProcEnabled = false;      // reduced-resolution switch
+    int   m_optProcScale   = 50;         // its slider, 25..100 (% of the video)
     volatile bool m_optDirty = false;
     volatile double m_lastProcessMs = 0.0;
     volatile LONG m_paramRev = 0;
@@ -1818,12 +1953,17 @@ public:
         // the control panel toggle the master switch mid-playback.
         m_engine.SeedOptionsOnce(m_cfg.enabled, m_cfg.style, m_cfg.intensity,
                                  m_cfg.localTone, m_cfg.localStruct,
-                                 m_cfg.skinStruct, m_cfg.autoMask);
+                                 m_cfg.skinStruct, m_cfg.autoMask,
+                                 m_cfg.dropFrames, m_cfg.maxLagMs,
+                                 m_cfg.procEnabled, m_cfg.procScale);
         if (g_shared) m_lastSeq = g_shared->reqSeq;
         LogRaw("filter: created; config enabled=%d style=%d intensity=%d%% "
-               "skinstructure=%d%% automask=%d",
+               "skinstructure=%d%% automask=%d dropframes=%d maxlagms=%d "
+               "procscale=%d%% (enabled=%d)",
                m_cfg.enabled ? 1 : 0, m_cfg.style, (int)(m_cfg.intensity * 100),
-               (int)(m_cfg.skinStruct * 100), m_cfg.autoMask ? 1 : 0);
+               (int)(m_cfg.skinStruct * 100), m_cfg.autoMask ? 1 : 0,
+               m_engine.OptDropFrames() ? 1 : 0, m_engine.OptMaxLagMs(),
+               m_engine.OptProcScale(), m_engine.OptProcEnabled() ? 1 : 0);
     }
     virtual ~CDlssNrFilter() {
         // Unregister first: the panel thread walks this list, so it must not see
@@ -1882,13 +2022,15 @@ public:
         s->reqApplied = seq;
     }
 
-    void PublishTelemetry(int w, int h, int bpp, bool processed, int reasonOverride) {
+    void PublishTelemetry(int w, int h, int bpp, bool processed, int reasonOverride,
+                          bool dropped = false) {
         if (!g_shared) return;
         SharedState* s = g_shared;
         InterlockedIncrement(&s->heartbeat);
         InterlockedIncrement(&s->framesSeen);
-        if (processed) InterlockedIncrement(&s->framesProcessed);
-        else           InterlockedIncrement(&s->framesPassthrough);
+        if (dropped)        InterlockedIncrement(&s->framesDropped);
+        else if (processed) InterlockedIncrement(&s->framesProcessed);
+        else                InterlockedIncrement(&s->framesPassthrough);
         s->engineReady   = m_engine.Ready() ? 1 : 0;
         s->engineGaveUp  = m_engine.GaveUp() ? 1 : 0;
         s->engineW       = m_engine.Width();
@@ -1898,6 +2040,13 @@ public:
         s->inputBpp      = bpp;
         s->enabled       = m_engine.OptEnabled() ? 1 : 0;
         s->lastProcessMs = m_engine.LastProcessMs();
+        // ---- late-frame policy ----
+        // Cumulative for the life of this shared block, i.e. it spans every file
+        // this process has played, exactly like framesSeen/Processed above.
+        const long seen = s->framesSeen, drp = s->framesDropped;
+        s->dropEnabled   = m_engine.OptDropFrames() ? 1 : 0;
+        s->dropPct       = (seen > 0) ? (float)(100.0 * (double)drp / (double)seen) : 0.0f;
+        s->dropLagMs     = m_dropLagMs;
         s->pid           = (long)GetCurrentProcessId();
         SetStatus(reasonOverride, "%s", m_statusText);
     }
@@ -1950,12 +2099,14 @@ public:
         // a delivery that will never be useful -- the seek hang.
         m_flushing = true;
         m_needReset = true;
+        ForgetDropAnchor();       // the next frame starts a new timeline
         LogRaw("filter: Stop -> stopped (frames while paused: %d)", m_framesWhilePaused);
         return S_OK;
     }
     STDMETHODIMP Pause() {
         m_state = State_Paused;
         m_flushing = false;                 // EndFlush may never arrive
+        ForgetDropAnchor();                 // pausing ends the current timeline
         // Now that a format is locked in, warm the engine up. Async: the graph
         // keeps running and frames pass through until the model is loaded.
         int w = 0, h = 0;
@@ -1967,8 +2118,10 @@ public:
         // request when the session already matches -- a seek pings Pause a lot
         // and there is no reason to touch the engine on each one.
         if (w > 0 && h > 0 && !(m_engine.Ready() &&
-                                m_engine.Width() == w && m_engine.Height() == h)) {
-            LogRaw("filter: Pause -> requesting engine init %dx%d", w, h);
+                                m_engine.Width() == w && m_engine.Height() == h &&
+                                m_engine.Scale() == m_engine.ProcScalePct())) {
+            LogRaw("filter: Pause -> requesting engine init %dx%d at %d%%",
+                   w, h, m_engine.ProcScalePct());
             m_engine.RequestInit(w, h);
         }
         return S_OK;
@@ -1977,6 +2130,7 @@ public:
         m_state = State_Running;
         m_flushing = false;
         m_needReset = true;
+        ForgetDropAnchor();       // re-anchor on the first frame of this run
         LogRaw("filter: Run -> running (paused-time frames seen: %d)", m_framesWhilePaused);
         m_framesWhilePaused = 0;
         m_droppedFlush = m_droppedStopped = 0;
@@ -2227,6 +2381,136 @@ public:
         return done;
     }
 
+    // ---- late-frame policy --------------------------------------------------
+    //
+    // Why this exists: DoReceive() is synchronous, so one input frame costs one
+    // engine run ON THE SOURCE'S STREAMING THREAD. When that costs more than the
+    // frame interval -- measured: 34.7 ms against 4K60's 16.7 ms budget, 17.7 ms
+    // against 2560x1440p120's 8.3 ms -- the video branch advances at 1/cost fps
+    // while the audio renderer follows the reference clock. Every frame is then
+    // delivered late, and the lateness ADDS UP: the picture slides further behind
+    // the sound the longer the file plays, which is the "slow motion" symptom.
+    //
+    // Dropping does not shift anything: the frames that ARE delivered keep their
+    // original timestamps, so the renderer still shows them at the right
+    // wall-clock moment. The offset stops growing and settles at about one engine
+    // run -- the unavoidable latency of a pipeline that costs that much per frame.
+    //
+    // Judged against the reference clock (IReferenceClock, already stored by
+    // SetSyncSource), because that is what the audio and video renderers both
+    // schedule to.
+    //
+    // The anchor is re-taken on the first frame of every segment, so nothing here
+    // assumes when the graph started relative to the clock, and a paused-then-run
+    // graph (where Run()'s tStart can be seconds away from the first frame) is
+    // handled: the anchor frame DEFINES "on time", and every frame after it is
+    // measured as growth relative to that.
+    static const long           kMaxConsecDrops = 12;        // starvation guard
+    static const REFERENCE_TIME kReanchorTicks  = 20000000;  // 2 s: clock jumped
+
+    void ReanchorDropClock(REFERENCE_TIME now, REFERENCE_TIME ts) {
+        m_dropSeedValid  = true;
+        m_dropSeedClock  = now;
+        m_dropSeedStream = ts;
+        m_minLag         = 0;
+        m_consecDrops    = 0;
+    }
+
+    // Called from Stop/Pause/Run and on every new segment: the next frame is the
+    // anchor again (its timestamps belong to a different timeline).
+    void ForgetDropAnchor() { m_dropSeedValid = false; m_minLag = 0; }
+
+    // The interval the stream really has: what we MEASURED once two frames have
+    // arrived, or what the media type declares before that. The declared value
+    // alone is not enough -- AvgTimePerFrame is 0 for VFR and a re-timing
+    // decoder moves it -- but it is a better starting point than a guess.
+    REFERENCE_TIME EffectiveFrameInterval() {
+        if (m_frameInterval > 0) return m_frameInterval;
+        return FrameIntervalOf(m_in ? m_in->MediaType() : nullptr);
+    }
+
+    // Allowed lateness at the moment a frame is handed to the engine.
+    REFERENCE_TIME DropBudgetTicks() {
+        const REFERENCE_TIME cost = (REFERENCE_TIME)(m_engine.LastProcessMs() * 10000.0);
+        // Auto: engine cost + one frame interval. The same cost is added on the
+        // other side of the comparison in ShouldDropLateFrame(), so this reduces
+        // to "more than one frame interval behind" -- it adapts to whatever the
+        // engine currently costs instead of hard-coding today's 4K number.
+        const REFERENCE_TIME autoBudget = cost + EffectiveFrameInterval();
+        const int ms = m_engine.OptMaxLagMs();
+        if (ms <= 0) return autoBudget;
+        // "maxlagms" is a ceiling on how much extra lateness is tolerated, so it
+        // can only ever make the policy MORE tolerant. Asking for less than one
+        // engine run would mean dropping nearly every frame (a frame that costs
+        // 34 ms can never be only 10 ms late and still be shown on time), which
+        // is a slideshow, not a setting -- so the auto value is the floor.
+        const REFERENCE_TIME want = (REFERENCE_TIME)ms * 10000;
+        return want > autoBudget ? want : autoBudget;
+    }
+
+    bool ShouldDropLateFrame(IMediaSample* pIn, int w, int h, bool isYuv) {
+        // The switch can be flipped from the panel or the tray while a file plays.
+        // The anchor from before the change would look like a burst of lateness,
+        // so start over; a stale anchor is also what the 2 s guard below catches.
+        const bool on = m_engine.OptDropFrames();
+        if (on != m_dropWasOn) { m_dropWasOn = on; ForgetDropAnchor(); }
+        // Only when the engine is what limits the rate. In pass-through a frame
+        // costs a memcpy, which keeps up with any rate we accept, so dropping
+        // there would throw picture away for nothing.
+        if (!on) return false;
+        if (!m_engine.OptEnabled() || !m_engine.Ready()) return false;
+        if (!isYuv || m_engine.Width() != w || m_engine.Height() != h) return false;
+        if (m_state != State_Running) return false;   // a paused graph sends none
+        if (!m_pClock) return false;                  // nothing to judge against
+        if (pIn->IsPreroll() == S_OK) return false;   // the renderer needs this one
+
+        REFERENCE_TIME ts = 0, te = 0;
+        if (pIn->GetTime(&ts, &te) != S_OK) return false;   // no timestamp to judge
+
+        // The yardstick is the interval the stream really has: AvgTimePerFrame is
+        // a starting guess, but it is 0 for VFR and a re-timing decoder moves it.
+        if (m_lastTsValid && ts > m_lastTs) {
+            const REFERENCE_TIME d = ts - m_lastTs;
+            if (d >= 10000 && d <= 10000000) {          // ignore seek-sized gaps
+                m_frameInterval = (m_frameInterval <= 0)
+                                ? d : (REFERENCE_TIME)((m_frameInterval * 7 + d) / 8);
+            }
+        }
+        m_lastTs = ts; m_lastTsValid = true;
+
+        REFERENCE_TIME now = 0;
+        if (FAILED(m_pClock->GetTime(&now))) return false;
+
+        if (!m_dropSeedValid || pIn->IsDiscontinuity() == S_OK) {
+            ReanchorDropClock(now, ts);
+            return false;                       // the anchor frame is always sent
+        }
+
+        // Positive = this frame should already have been on screen `lag` ago.
+        const REFERENCE_TIME lag = (now - m_dropSeedClock) - (ts - m_dropSeedStream);
+        if (lag < m_minLag) m_minLag = lag;
+        const REFERENCE_TIME rel = lag - m_minLag;
+        m_dropLagMs = (float)((double)rel / 10000.0);
+
+        // A clock jump would otherwise make every frame for the rest of the
+        // session look hopeless; the starvation guard is no substitute for
+        // noticing that the anchor itself is wrong.
+        if (rel > kReanchorTicks) {
+            LogRaw("filter: drop policy re-anchored (lag %.1f ms - clock jumped?)",
+                   (double)rel / 10000.0);
+            ReanchorDropClock(now, ts);
+            return false;
+        }
+
+        // Starvation guard: if the judgement is ever wrong -- a bad anchor, a
+        // source that lies about its timestamps -- this keeps the picture moving
+        // (as a visible stutter) instead of freezing it forever.
+        if (m_consecDrops >= kMaxConsecDrops) return false;
+
+        const REFERENCE_TIME cost = (REFERENCE_TIME)(m_engine.LastProcessMs() * 10000.0);
+        return rel + cost > DropBudgetTicks();
+    }
+
     // ---- streaming: the engine lives here ----
     HRESULT DoReceive(IMediaSample* pIn) {
         if (!pIn) return E_POINTER;
@@ -2264,6 +2548,32 @@ public:
         // Pick up panel changes BEFORE processing so they take effect on this
         // very frame instead of the next one.
         ApplyRequests();
+
+        // ---- late-frame policy: decide BEFORE spending 34 ms on the frame ----
+        // That is the point of doing it here: a dropped frame costs nothing,
+        // whereas deciding after the engine run would still leave the graph behind.
+        if (ShouldDropLateFrame(pIn, w, h, isYuv)) {
+            if (InterlockedIncrement(&m_droppedLate) == 1) {
+                char buf[160];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                            "ACTIVE %dx%d  %.1f ms/frame  dropping late frames",
+                            w, h, m_engine.LastProcessMs());
+                SetStatusLocal(buf);
+                const REFERENCE_TIME iv = EffectiveFrameInterval();
+                LogRaw("filter: dropping late frames at %dx%d -- engine %.1f ms/frame "
+                       "against a %.1f ms interval (%d fps in, ~%d fps out)",
+                       w, h, m_engine.LastProcessMs(), (double)iv / 10000.0,
+                       (int)(10000000.0 / iv + 0.5),
+                       m_engine.LastProcessMs() > 0.0
+                           ? (int)(1000.0 / m_engine.LastProcessMs() + 0.5) : 0);
+            }
+            ++m_consecDrops;
+            // Counts as a frame SEEN but neither processed nor passed through:
+            // the panel shows those in its own column.
+            PublishTelemetry(w, h, bpp, false, kReasonNone, true);
+            return S_OK;      // consumed and discarded: no engine run, no delivery
+        }
+        m_consecDrops = 0;
 
         BYTE* pSrc = nullptr;
         if (FAILED(pIn->GetPointer(&pSrc)) || !pSrc) return E_UNEXPECTED;
@@ -2379,6 +2689,7 @@ public:
         m_segStop = tStop;
         m_segRate = rate;
         m_segValid = true;
+        ForgetDropAnchor();       // a seek/rate change restarts stream time
         ForwardSegment(tStart, tStop, rate);
     }
 
@@ -2439,6 +2750,19 @@ private:
     volatile long m_framesWhilePaused = 0;
     volatile long m_droppedFlush = 0;
     volatile long m_droppedStopped = 0;
+
+    // ---- late-frame policy state (see ShouldDropLateFrame) ----
+    bool           m_dropSeedValid  = false;  // is there an anchor to judge against
+    REFERENCE_TIME m_dropSeedClock  = 0;      // clock when the anchor frame arrived
+    REFERENCE_TIME m_dropSeedStream = 0;      // that frame's presentation time
+    REFERENCE_TIME m_minLag         = 0;      // smallest lag seen since the anchor
+    REFERENCE_TIME m_lastTs         = 0;      // previous input timestamp
+    REFERENCE_TIME m_frameInterval  = 0;      // MEASURED input frame interval (EMA)
+    bool           m_lastTsValid    = false;
+    volatile long  m_consecDrops    = 0;      // starvation-guard counter
+    volatile long  m_droppedLate    = 0;      // frames this policy dropped
+    volatile float m_dropLagMs      = 0.0f;   // last measured lateness (telemetry)
+    bool           m_dropWasOn      = false;  // switch state at the previous frame
 
     // ---- the paused refresh (see StepOneFrame) ----
     volatile bool m_refreshQueued = false;
