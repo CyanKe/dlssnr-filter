@@ -23,6 +23,50 @@
 ; handy for an A/B comparison while watching the same clip.
 enabled=1
 
+; ---------------------------------------------------------------------------
+; Layers -- how many DLSSNR passes per frame
+; ---------------------------------------------------------------------------
+; The filter can run SEVERAL DLSSNR passes per frame, each one fed the previous
+; one's output. Every layer keeps its own parameters, and every layer gets its
+; OWN NGX feature -- i.e. its own temporal history. That last part is not an
+; implementation detail: running two passes on ONE feature makes the second pass
+; read a history identical to its own input, which doubles the temporal loop
+; gain and makes flat areas pulse at the frame rate (dlssnr-toolkit measured
+; stage-mean instability 0.091 -> 0.223 for a static input, 0.139 -> 0.531 with
+; slow motion, going from one pass to two on a shared feature). This filter
+; therefore ships one feature per layer.
+;
+; COST: every layer is a FULL neural pass, so a chain of N costs roughly N times
+; a single pass (the README has the measured per-layer times). Watch ms/frame on
+; the panel's status page while adding a layer, and see "dropframes" below for
+; what happens when the total no longer fits the frame interval. 2-3 layers is
+; the realistic range.
+;
+; 1 (default) = a single pass, which is exactly how every version before layers
+; existed behaved. Range 1..8.
+;
+; The control panel's "Reset defaults" goes back to this value too: 1 is the
+; documented default, so a reset that left three passes running would not be a
+; reset. (It does NOT delete the layer2_..layer8_ keys already stored here --
+; those layers are simply inactive.)
+layers=1
+
+; ---------------------------------------------------------------------------
+; Layer 1's parameters
+; ---------------------------------------------------------------------------
+; Every key in this block describes LAYER 1. Layers 2..8 use the same names with
+; a "layer<N>_" prefix, e.g.
+;     layer2_style=1
+;     layer2_intensity=100
+;     layer2_localtone=100
+;     layer2_localstruct=100
+;     layer2_skinstructure=0
+;     layer2_automask=0
+; ...through layer8_. A layer whose keys are missing starts from the documented
+; defaults in this block, and raising the layer count in the control panel copies
+; the previous layer's settings into the new one (so "one more pass" starts from
+; the look you already dialled in instead of from scratch).
+
 ; Denoiser style: 0 = default, 1 = natural, 2 = cinema, 3 = style 3.
 style=1
 
@@ -117,6 +161,71 @@ procenable=0
 ; The panel slider only applies when a drag ends -- each change re-creates the
 ; NGX session (~0.2 s, frames pass through while it does).
 procscale=50
+
+; ---------------------------------------------------------------------------
+; Extrapolation -- extrap
+; ---------------------------------------------------------------------------
+; NOT a layer count, and the panel calls it 外推 / Extrapolate for that reason.
+; The filter runs its pass(es) once and then REPLACES the look of a further pass
+; with arithmetic on the correction it already has:
+;
+;     out = proc + (gain - 1) * (proc - in)
+;
+; which costs one extra texture read per output pixel instead of a whole
+; inference. Measured on this machine: ~0.4 ms/frame against ~8.4 ms for one
+; more layer -- about 1/20.
+;
+; It is not equivalent to stacking. Measured against real layer output on real
+; footage, reproducing the layer-2 step: Y 87%, UV 79%. And it degrades with
+; depth, because the per-layer corrections are nearly collinear (cos 0.988 /
+; 0.966 / 0.926) but DECAY (0.771 / 0.591 / 0.461 of layer 1's), so:
+;
+;   gain 1.80 -> emulates layer 2 (the useful one)
+;   gain 2.40 -> emulates layer 3 (starts to drift)
+;   gain 2.85 -> emulates layer 4 (visibly wrong)
+;
+; The gain that emulates N layers is the GEOMETRIC sum (1.80 / 2.40 / 2.85),
+; never N -- k = N overshoots systematically (at k = 4, 83% of pixels differ
+; from the real 4-layer output by more than 2 levels).
+;
+; Percent, 100..400, applied once over the whole chain (not per layer).
+; 100 (default) = OFF, and off is bit-identical to the build before this key
+; existed. The control panel's row reads "关 / off" at 100.
+extrap=100
+
+; ---------------------------------------------------------------------------
+; Model -- which network inside nvngx_dlssnr.dll to run
+; ---------------------------------------------------------------------------
+; DLSSNR chooses its network with a feature-CREATION parameter
+; (DLSSNR.Hint.Render.Preset), and a DLL can carry more than one:
+;
+;   nvngx_dlssnr.dll 310.8.0   one network   WEIGHTS_HT
+;   nvngx_dlssnr.dll 310.9.16  two networks  WEIGHTS_HT + WEIGHTS_CC_SMALL_FP8
+;
+; 310.9.16 is the 2026-10-16 "2x faster model" release: its default network is
+; the new lighter one (31 blocks / 76 layers instead of 71 / 152, ~22% fewer
+; parameters, about 40% less network GPU time at the same visual intent), while
+; the 310.8.0 network is still in the same DLL, byte-identical, reachable as
+; preset 1. That is what makes an A/B possible without swapping DLLs.
+;
+;   0 (default) = the DLL's own default. On 310.9.16 that is the NEW network; on
+;                 310.8.0 it is the only one there is. Every ini written before
+;                 this key existed describes exactly this, so old files are
+;                 unaffected.
+;   1 = WEIGHTS_HT, the 310.8.0 network (heavier, more aggressive edit)
+;   2 = WEIGHTS_CC_SMALL_FP8, the 310.9.16 network
+;   3..8 = raw preset ids, for a DLL that carries a network this build has no
+;          name for yet. The panel's "预设 N" segment cycles them.
+;
+; A preset the loaded DLL does not carry is refused by the engine, which then
+; runs the DLL default and says so in the log and on the panel's status page --
+; a wrong value here cannot cost you the picture, only the setting.
+;
+; Changing this re-creates the NGX session (the preset is a creation parameter),
+; so expect the same brief pass-through as a procscale change. Read the applied
+; value on the panel's status page ("模型: ... 引擎实际: ..."), and
+; tools\read_telemetry.py prints requested/applied as the mdl column.
+model=0
 
 ; ---------------------------------------------------------------------------
 ; Control panel (native Win32 window owned by the filter -- no Python needed)

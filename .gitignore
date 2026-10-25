@@ -12,6 +12,10 @@ NVCVImage.dll
 nvVFXVideoSuperRes.dll
 NvOF*.dll
 nvofapi*.dll
+# A backup copy of one of those is still the same NVIDIA binary. The patterns
+# above only match a name ENDING in .dll, so "nvngx_dlssnr3.10.8.0.dll.bak"
+# slipped through and would have been committed -- keep backups out too.
+*.dll.bak
 
 # --- our own engine host DLL (built from dlssnr-toolkit, not a source file) --
 dlssnr_host2.dll
@@ -61,4 +65,15 @@ desktop.ini
 
 # --- live settings written back by the panel (see app/dlssnr_dshow.ini.template) --
 app/dlssnr_dshow.ini
+
+# --- the promo video pipeline ---------------------------------------------
+# promo/ holds the scripts that render the video (Pillow frames + TTS voice) and
+# every intermediate artifact it produces. NOT tracked: mimo_key.txt in here is
+# a TTS credential.
+/promo/
+
+# The finished film is NOT tracked either -- 35 MB of binary in a source repo,
+# and it can be regenerated from promo/. docs/promo/ stays on disk locally.
+# (This is deliberately different from the older rule that shipped the film.)
+/docs/promo/
 

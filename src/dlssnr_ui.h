@@ -21,6 +21,10 @@
 
 #include <commctrl.h>
 #include <shellapi.h>
+// Self-sufficient on purpose (the same reason dlssnr_layers.h is): the model row
+// compares the DLL's resource names, and this header must not depend on the
+// including translation unit having pulled <string.h> in first.
+#include <string.h>
 
 // ---------------------------------------------------------------------------
 // option plumbing
@@ -41,6 +45,21 @@ static bool DlssNrAutoshow();   // defined with the tray section below
 
 static const wchar_t* kDlssNrStyleNames[4] = { L"默认", L"自然", L"电影", L"风格3" };
 static const int kDlssNrStyleCount = 4;
+
+// The model row's segments. Four, always:
+//   0 = 自动 / Auto      -> preset 0, the DLL's own default (always available)
+//   1 = HT               -> preset 1, needs the DLL to carry WEIGHTS_HT
+//   2 = CC-S             -> preset 2, needs WEIGHTS_CC_SMALL_FP8
+//   3 = 预设 N / Preset N -> the raw id escape hatch: it cycles the ids the
+//                            three above do not cover, which is how a network a
+//                            future DLL adds is selectable the day it ships.
+// A segment whose resource the loaded DLL does not carry is drawn inert (not
+// hidden) so the row keeps its shape and the absence is visible; the status
+// page's model line names what the DLL actually has.
+static const int kDlssNrModelBtnCount = 4;
+static const int kDlssNrModelBtnCustom = 3;   // index of the raw-id segment
+static const wchar_t* kDlssNrModelLblZh = L"模型";
+static const wchar_t* kDlssNrModelLblEn = L"Model";
 // Sliders are percentages of the engine's own units: 100% = 1.0, 200% = 2.0.
 // 100% stays the reset default, so existing configurations and the old feel are
 // unchanged (skin structure defaults to 0 = off, like Magpie's).
@@ -52,7 +71,19 @@ static const int kDlssNrStyleCount = 4;
 //     so those run to 200%.
 static const int kDlssNrSliderCount = 4;
 static const int kDlssNrSliderMax[kDlssNrSliderCount] = { 100, 200, 200, 200 };
-static const int kDlssNrSliderDef[kDlssNrSliderCount] = { 100, 100, 100, 0 };
+
+// The per-row Reset target: LayerDefault()'s value for that row. The defaults
+// (and the ranges above) live in exactly one place -- dlssnr_layers.h -- so a
+// Reset cannot drift from the value the ini reader falls back to.
+static int DlssNrSliderDefault(int i) {
+    const dlssnr::LayerCfg d = dlssnr::LayerDefault();
+    switch (i) {
+    case 0:  return d.pctIntensity;
+    case 1:  return d.pctTone;
+    case 2:  return d.pctStruct;
+    default: return d.pctSkin;
+    }
+}
 
 // Tray-menu presets, one list per slider range.
 static const int kDlssNrPct100[5] = { 0, 25, 50, 75, 100 };
@@ -65,28 +96,79 @@ static int DlssNrPctMax(float v, int maxPct) {
 }
 
 // The single place that mutates the live engine and, optionally, the ini.
+// The edit lands on the layer the panel is currently editing (Engine's selected
+// layer). Layer 1 writes the historical unprefixed keys and layers 2..8 write
+// layer<N>_*; dlssnr::LayerKeyName() owns that rule, so this writer cannot drift
+// from ReadConfig() in dlssnr_dshow.cpp -- a drift there shows up as "the panel
+// writes a setting the next launch ignores", which is invisible in a diff.
 static void DlssNrApply(bool enabled, int style, int pctInt, int pctTone, int pctStruct,
                         int pctSkin, bool autoMask, bool persist) {
-    Engine::Instance().SetOptions(enabled, style,
-                                  pctInt / 100.0f, pctTone / 100.0f, pctStruct / 100.0f,
-                                  pctSkin / 100.0f, autoMask);
+    Engine& e = Engine::Instance();
+    e.SetOptions(enabled, style,
+                 pctInt / 100.0f, pctTone / 100.0f, pctStruct / 100.0f,
+                 pctSkin / 100.0f, autoMask);
     // One line per committed edit. Without it a field log cannot tell "the user
     // never changed anything" from "the change never reached the engine" -- which
     // is exactly the difference between a broken refresh and a disabled engine.
     if (persist)
-        LogRaw("ui: applied enabled=%d style=%d intensity=%d%% tone=%d%% struct=%d%% skin=%d%% mask=%d",
+        LogRaw("ui: applied layers=%d sel=%d enabled=%d style=%d intensity=%d%% "
+               "tone=%d%% struct=%d%% skin=%d%% mask=%d",
+               e.OptLayerCount(), e.OptSelLayer() + 1,
                enabled ? 1 : 0, style, pctInt, pctTone, pctStruct, pctSkin, autoMask ? 1 : 0);
     // A paused graph has no frames coming, so tell the filter(s) to re-render the
     // frame they cached. Push, not poll: this is the edit that just happened.
     DlssNrRefreshSinks(persist);
     if (!persist) return;
-    DlssNrIniWriteInt(L"enabled",       enabled ? 1 : 0);
-    DlssNrIniWriteInt(L"style",         style);
-    DlssNrIniWriteInt(L"intensity",     pctInt);
-    DlssNrIniWriteInt(L"localtone",     pctTone);
-    DlssNrIniWriteInt(L"localstruct",   pctStruct);
-    DlssNrIniWriteInt(L"skinstructure", pctSkin);
-    DlssNrIniWriteInt(L"automask",      autoMask ? 1 : 0);
+    DlssNrIniWriteInt(L"enabled", enabled ? 1 : 0);
+    // The count travels with every commit too. The stepper/tray write it when the
+    // chain's shape changes; writing it here as well keeps a stale ini from ever
+    // describing a different chain than the one the engine is running.
+    DlssNrIniWriteInt(L"layers", e.OptLayerCount());
+    const int layer1 = e.OptSelLayer() + 1;
+    wchar_t k[64];
+    dlssnr::LayerKeyName(layer1, L"style",         k, _countof(k)); DlssNrIniWriteInt(k, style);
+    dlssnr::LayerKeyName(layer1, L"intensity",     k, _countof(k)); DlssNrIniWriteInt(k, pctInt);
+    dlssnr::LayerKeyName(layer1, L"localtone",     k, _countof(k)); DlssNrIniWriteInt(k, pctTone);
+    dlssnr::LayerKeyName(layer1, L"localstruct",   k, _countof(k)); DlssNrIniWriteInt(k, pctStruct);
+    dlssnr::LayerKeyName(layer1, L"skinstructure", k, _countof(k)); DlssNrIniWriteInt(k, pctSkin);
+    dlssnr::LayerKeyName(layer1, L"automask",      k, _countof(k)); DlssNrIniWriteInt(k, autoMask ? 1 : 0);
+}
+
+// Persist the whole active chain: the count plus every layer's six keys. Used
+// when the chain's SHAPE changes (the stepper, the tray's Layers menu, reset
+// defaults), because there is no single "current layer" edit to write there.
+// Growing copies the last layer into the new slots inside the engine, so without
+// this the copy would not survive a restart even though it is what the user sees.
+// Every key goes through LayerKeyName(), same as DlssNrApply() above.
+static void DlssNrWriteLayers() {
+    Engine& e = Engine::Instance();
+    const int n = e.OptLayerCount();
+    DlssNrIniWriteInt(L"layers", n);
+    wchar_t k[64];
+    for (int i = 0; i < n; ++i) {
+        const dlssnr::LayerCfg l = e.OptLayer(i);
+        const int layer1 = i + 1;
+        dlssnr::LayerKeyName(layer1, L"style",         k, _countof(k)); DlssNrIniWriteInt(k, l.style);
+        dlssnr::LayerKeyName(layer1, L"intensity",     k, _countof(k)); DlssNrIniWriteInt(k, l.pctIntensity);
+        dlssnr::LayerKeyName(layer1, L"localtone",     k, _countof(k)); DlssNrIniWriteInt(k, l.pctTone);
+        dlssnr::LayerKeyName(layer1, L"localstruct",   k, _countof(k)); DlssNrIniWriteInt(k, l.pctStruct);
+        dlssnr::LayerKeyName(layer1, L"skinstructure", k, _countof(k)); DlssNrIniWriteInt(k, l.pctSkin);
+        dlssnr::LayerKeyName(layer1, L"automask",      k, _countof(k)); DlssNrIniWriteInt(k, l.autoMask);
+    }
+}
+
+// Extrapolation gain. Deliberately its own row and its own code path: this is
+// NOT a layer count. A layer runs the network again; this re-uses the one pass's
+// correction and scales it, which costs one extra texture read instead of a
+// whole inference. The engine clamps to [100,400]; 100 IS off, and off is
+// bit-identical to the build that shipped before this row existed.
+static void DlssNrApplyExtrap(int pct, bool persist) {
+    if (pct < 100) pct = 100;
+    if (pct > 400) pct = 400;
+    Engine::Instance().SetExtrap(pct);
+    if (persist) DlssNrIniWriteInt(L"extrap", pct);
+    LogRaw("ui: extrap = %d%%", pct);
+    DlssNrRefreshSinks(persist);
 }
 
 // The late-frame switch. Deliberately NOT part of DlssNrApply(): it is not an
@@ -114,6 +196,67 @@ static void DlssNrApplyProcScale(bool enabled, int pct, bool persist) {
         DlssNrIniWriteInt(L"procscale",  pct);
     }
     LogRaw("ui: procscale = %d%% (enabled=%d)", pct, enabled ? 1 : 0);
+}
+
+// ---------------------------------------------------------------------------
+// the model row: which network inside nvngx_dlssnr.dll to run
+// ---------------------------------------------------------------------------
+// The DLL's own contents decide which segments can do anything, so this asks the
+// engine's capability scan (dlssnr::DllWeights -- the WEIGHTS_* names in the
+// loaded image) rather than trusting the file version. `preset` -1 in the
+// returned list means "a network this build has no name for", which is exactly
+// what the raw-id segment is for.
+//
+// A resource is "available" when the DLL carries the name the table maps to that
+// preset. Preset 0 needs no resource (it IS the default), so it is always there.
+static bool DlssNrModelAvailable(int preset, const dlssnr::DllWeight* w, int n) {
+    if (preset == 0) return true;
+    const char* need = dlssnr::ModelResource(preset);
+    if (!need || !need[0]) return true;          // nothing named -> nothing to check
+    for (int i = 0; i < n; ++i)
+        if (strcmp(w[i].name, need) == 0) return true;
+    return false;
+}
+
+// The preset a segment selects. Segments 0..2 ARE the preset ids; the last one is
+// the raw id, whose value is whatever the user cycled it to.
+static int DlssNrModelSegmentPreset(int seg, int rawId) {
+    if (seg == kDlssNrModelBtnCustom) return dlssnr::ModelClamp(rawId);
+    return seg;                                  // 0, 1, 2 == the preset ids
+}
+
+// The id the raw-id segment applies when clicked: cycle the ids the fixed
+// segments do not cover, and jump to the first of them when a fixed segment is
+// selected, so one click always lands somewhere new.
+static int DlssNrModelCustomNext(int cur) {
+    if (cur < kDlssNrModelBtnCustom) return kDlssNrModelBtnCustom;
+    int id = cur + 1;
+    if (id > (int)dlssnr::kMaxModelPreset) id = kDlssNrModelBtnCustom;
+    return id;
+}
+
+// Which segment the current preset lights up. The raw-id segment owns every id
+// the fixed segments do not name.
+static bool DlssNrModelSegActive(int seg, int cur) {
+    if (seg == kDlssNrModelBtnCustom) return cur >= kDlssNrModelBtnCustom;
+    return cur == seg;
+}
+
+// Applying it is a session rebuild (the preset is a FEATURE-CREATION parameter,
+// so the features have to be re-made), which is why this mirrors
+// DlssNrApplyProcScale and not DlssNrApply: the worker rebuilds, frames pass
+// through for the moment that takes, and a refused preset falls back inside the
+// engine instead of costing the picture.
+static void DlssNrApplyModel(int preset, bool persist) {
+    preset = dlssnr::ModelClamp(preset);
+    Engine::Instance().SetModel(preset);
+    if (persist) DlssNrIniWriteInt(L"model", preset);
+    // One line, and it names the resource the preset selects: "which network did
+    // that switch to" is the whole question this feature exists to answer, and a
+    // number alone does not answer it in a field log.
+    const char* res = dlssnr::ModelResource(preset);
+    LogRaw("ui: model preset = %d (%s)", preset,
+           (res && res[0]) ? res : "DLL default");
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +367,29 @@ enum {
     IDC_DLS_PROCLBL = 1130,
     IDC_DLS_PROCTRK = 1131,
     IDC_DLS_PROCVAL = 1132,
+    // The extrapolation row: same shape as the processing-resolution row above,
+    // and also NOT one of the kDlssNrSliderCount rows -- its range is 100..400
+    // because it is a GAIN, not a strength, and 100 means off.
+    IDC_DLS_EXTRAPLBL = 1135,
+    IDC_DLS_EXTRAPTRK = 1136,
+    IDC_DLS_EXTRAPVAL = 1137,
+    // Both global rows get a Reset in the same column the per-layer rows use.
+    // They used to have none, on the argument that "100 % IS the reset" -- true,
+    // and still not what a user reaching for the button next to the slider
+    // expects. Reset here means the documented default, not "off": for the
+    // processing resolution that is 50 % (the value it restores to), for
+    // extrapolation it is 100 % (= off, which is the documented default).
+    IDC_DLS_PROCRST   = 1133,
+    IDC_DLS_EXTRAPRST = 1138,
+    // Layer count stepper and the current-layer strip. The strip is
+    // IDC_DLS_LAYER0 + i for layer i (0-based), so hit-testing the whole strip is
+    // one range check -- the same shape the style segments already use.
+    IDC_DLS_LAYERNAME   = 1140,   // "层数 / Layers" caption
+    IDC_DLS_LCOUNT_MINUS= 1141,   // the - half of the stepper
+    IDC_DLS_LAYERCOUNT  = 1142,   // the N readout between them
+    IDC_DLS_LCOUNT_PLUS = 1143,   // the + half
+    IDC_DLS_LAYERNOTE   = 1144,   // per-layer cost note under the row
+    IDC_DLS_LAYER0      = 1150,   // +0..kMaxLayers-1: select the edited layer
     // actions
     IDC_DLS_RESETALL= 1110,
     IDC_DLS_RECHECK = 1111,
@@ -236,6 +402,12 @@ enum {
     IDC_DLS_STATS   = 1122,
     IDC_DLS_GEOM    = 1123,
     IDC_DLS_HINT    = 1124,
+    IDC_DLS_LAYERS  = 1125,   // configured vs actually-built layer counts
+    // The model row: one segment per choice, plus a caption and a status line.
+    // Which network inside nvngx_dlssnr.dll to run -- see src\dlssnr_models.h.
+    IDC_DLS_MODELLBL = 1160,  // "模型 / Model" caption
+    IDC_DLS_MODEL0   = 1161,  // +0..kDlssNrModelBtnCount-1
+    IDC_DLS_MODELLINE= 1170,  // status page: which network is in effect
 };
 
 struct DlssNrSettings {
@@ -245,11 +417,26 @@ struct DlssNrSettings {
     HWND lbl[4], trk[4], val[4], rst[4];
     HWND chkEnable, chkAutoMask, chkDrop, chkProc, chkAutoshow;
     HWND lblProc, trkProc, valProc;  // the "processing resolution" row (25..100%)
+    HWND lblExtrap, trkExtrap, valExtrap;   // extrapolation gain row (100..400%, 100 = off)
+    HWND rstProc, rstExtrap;                // per-row Reset for the two global rows
+    // The model row: which network inside nvngx_dlssnr.dll to run. Session-level
+    // like the processing-resolution row above it, and built from
+    // src\dlssnr_models.h so a new network is one table row, not new plumbing.
+    HWND lblModel, modelBtn[kDlssNrModelBtnCount];
+    HWND lblModelLine;               // status page: which network is in effect
+    // Layer count stepper + current-layer strip. The strip selects WHICH layer
+    // the style / sliders / auto-mask edit, so it sits above all of them.
+    HWND lblLayerName, lblLayerCount, lblLayerNote;
+    HWND btnLayerMinus, btnLayerPlus;
+    HWND layerBtn[dlssnr::kMaxLayers];   // the 1..N strip (created once, shown per count)
     HWND btnResetAll, btnRecheck, btnLog;
-    HWND lblTitle, lblSub, lblStats, lblGeom, lblHint;
+    HWND lblTitle, lblSub, lblStats, lblGeom, lblHint, lblLayers;
     HFONT font, fontBold, fontBig, fontSmall;
     int   page;                      // 0 = parameters, 1 = status, 2 = compare
     int   shownStyle;                // style the segments currently show
+    int   shownLayerCount;           // N the stepper/strip currently show
+    int   shownSelLayer;             // layer the strip currently highlights
+    int   shownModel;                // preset the model segments currently show
     HWND  compareWnd;                // the 对比 window (created on first use)
     int   compareSplit;              // divider position, percent of the width
     bool  standalone;
@@ -278,6 +465,11 @@ struct DlssNrMetrics {
     int tabW, langW, styleW;       // segmented buttons
     int   headerH;                   // own title bar (borderless standalone window)
     int   closeW, closeH;            // header close button
+    int   layerRowH;                 // count stepper + current-layer strip row
+    int   layerStepW, layerCountW;   // stepper button / N readout widths
+    int   layerBtnW;                 // one button of the 1..N strip
+    int   layerNoteH;                // the dim per-layer cost note under the row
+    int   modelBtnW;                 // one segment of the model row
     int   chkW[5];                   // checkbox widths (box + label)
     int resetAllW, recheckW, logW; // action buttons
     int boxW, thumbW, thumbH, grooveH;
@@ -305,6 +497,37 @@ static const wchar_t* kDlssNrProcChkZh = L"降分辨率处理";
 static const wchar_t* kDlssNrProcChkEn = L"Reduce resolution";
 static const wchar_t* kDlssNrProcLblZh = L"处理分辨率";
 static const wchar_t* kDlssNrProcLblEn = L"Processing res.";
+// "外推" is the name the measurements earned: extrapolation reproduces the look
+// of a second pass, it does not perform one. Calling it "layers" would be a lie
+// the panel could not keep -- the numbers diverge from layer 3 on.
+static const wchar_t* kDlssNrExtrapLblZh = L"外推";
+static const wchar_t* kDlssNrExtrapLblEn = L"Extrapolate";
+
+// The layer row's caption and its cost note. One definition each: the layout
+// measures both languages in DlssNrGetMetrics(), and Retext paints the one the
+// current language needs -- a second copy is how a language switch ends up
+// clipping a line the layout sized for the other language.
+static const wchar_t* kDlssNrLayersLblZh = L"层数";
+static const wchar_t* kDlssNrLayersLblEn = L"Layers";
+static const wchar_t* kDlssNrLayerNoteZh =
+    L"每层是一次完整推理；风格、滑块和自动遮罩都作用于「当前层」。"
+    L"成本随层数线性增加，2–3 层是实用范围。";
+static const wchar_t* kDlssNrLayerNoteEn =
+    L"Each layer is a full pass; style, sliders and auto-mask all act on the "
+    L"current layer. Cost grows with the count; 2-3 layers is practical.";
+
+// The bottom hint. One definition, used by both the metrics (which measures it in
+// both languages to size the page) and the control that paints it -- the two used
+// to hold separate copies of the same sentence, which is how a language switch
+// ends up clipping a line the layout sized for the other language.
+static const wchar_t* kDlssNrHintZh =
+    L"参数实时生效；取消勾选「启用 DLSSNR」为真正的直通。"
+    L"引擎跟不上时，可勾「丢帧保同步」或「降分辨率处理」。"
+    L"「模型」选择 DLL 里的哪个网络，切换会重建会话。";
+static const wchar_t* kDlssNrHintEn =
+    L"Live: uncheck Enable DLSSNR for a true pass-through. "
+    L"If the engine cannot keep up, use Drop late frames or Reduce resolution. "
+    L"Model picks which network inside the DLL to run; switching rebuilds the session.";
 
 static const wchar_t* DlssNrStyleNameLang(int i, int lang) {
     static const wchar_t* zh[kDlssNrStyleCount] = { L"默认", L"自然", L"电影", L"风格3" };
@@ -363,10 +586,20 @@ static const DlssNrMetrics& DlssNrGetMetrics() {
     m.closeW   = S(26);
     m.closeH   = S(22);
 
+    // Layer strip: two small stepper halves around the N readout, then one digit
+    // button per layer, up to the kMaxLayers ceiling. Everything is measured
+    // rather than assumed, so a CJK font or a DPI scale cannot clip the digits.
+    const int digitW = DlssNrExtent(dc, L"8");
+    m.layerStepW  = DlssNrMax2(digitW, m.lineH) + S(12);
+    m.layerCountW = digitW + S(10);
+    m.layerBtnW   = digitW + S(14);
+    m.layerRowH   = m.segH;
+
     m.lblW = DlssNrMaxExtentLang(dc, L"局部结构", L"Local structure");
     m.lblW = DlssNrMax2(m.lblW, DlssNrMaxExtentLang(dc, L"局部色调", L"Local tone"));
     m.lblW = DlssNrMax2(m.lblW, DlssNrMaxExtentLang(dc, L"皮肤结构", L"Skin structure"));
     m.lblW = DlssNrMax2(m.lblW, DlssNrMaxExtentLang(dc, kDlssNrProcLblZh, kDlssNrProcLblEn));
+    m.lblW = DlssNrMax2(m.lblW, DlssNrMaxExtentLang(dc, kDlssNrExtrapLblZh, kDlssNrExtrapLblEn));
     m.lblW += S(8);
 
     m.valW = DlssNrExtent(dc, L"200%") + S(6);
@@ -379,6 +612,17 @@ static const DlssNrMetrics& DlssNrGetMetrics() {
         for (int i = 0; i < kDlssNrStyleCount; ++i)
             m.styleW = DlssNrMax2(m.styleW, DlssNrExtent(dc, DlssNrStyleNameLang(i, lang)));
     m.styleW += S(16);
+
+    // The model row's segments: measured over every label the table defines plus
+    // the widest raw-id form, in both languages, so neither a CJK font nor a row
+    // added to dlssnr_models.h later can clip a segment.
+    m.modelBtnW = 0;
+    for (int i = 0; i < dlssnr::ModelKnownCount(); ++i) {
+        const dlssnr::ModelInfo& mi = dlssnr::ModelTable()[i];
+        m.modelBtnW = DlssNrMax2(m.modelBtnW, DlssNrMaxExtentLang(dc, mi.zh, mi.en));
+    }
+    m.modelBtnW = DlssNrMax2(m.modelBtnW, DlssNrMaxExtentLang(dc, L"预设 8", L"Preset 8"));
+    m.modelBtnW += S(16);
 
     m.chkW[0] = DlssNrMaxExtentLang(dc, L"启用 DLSSNR", L"Enable DLSSNR") + m.boxW + S(10);
     m.chkW[1] = DlssNrMaxExtentLang(dc, L"自动遮罩", L"Automatic mask") + m.boxW + S(10);
@@ -397,6 +641,19 @@ static const DlssNrMetrics& DlssNrGetMetrics() {
     const int styleRowW = m.margin * 2 + m.lblW + m.gap
         + kDlssNrStyleCount * m.styleW + (kDlssNrStyleCount - 1) * m.btnGap;
     if (styleRowW > m.wantW) m.wantW = styleRowW;
+    // The strip is sized for the worst case (kMaxLayers buttons) even while only
+    // one is shown: the window must not resize when the count goes up.
+    const int layerRowW = m.margin * 2 + m.lblW + m.gap
+        + m.layerStepW + m.layerCountW + m.layerStepW
+        + m.gap + (int)dlssnr::kMaxLayers * m.layerBtnW
+        + ((int)dlssnr::kMaxLayers - 1) * m.btnGap;
+    if (layerRowW > m.wantW) m.wantW = layerRowW;
+    // The model row is sized for ALL of its segments even when the loaded DLL
+    // cannot serve some of them (those are drawn inert, not hidden): a different
+    // nvngx_dlssnr.dll must not resize the panel.
+    const int modelRowW = m.margin * 2 + m.lblW + m.gap
+        + kDlssNrModelBtnCount * m.modelBtnW + (kDlssNrModelBtnCount - 1) * m.btnGap;
+    if (modelRowW > m.wantW) m.wantW = modelRowW;
     // Two rows of checkboxes: (enable, mask, drop frames) then (resolution, autoshow).
     const int chkRow1W = m.margin * 2 + m.chkW[0] + m.chkW[1] + m.chkW[2] + 2 * m.gap;
     const int chkRow2W = m.margin * 2 + m.chkW[3] + m.chkW[4] + m.gap;
@@ -409,25 +666,39 @@ static const DlssNrMetrics& DlssNrGetMetrics() {
     const int hintW = m.wantW - 2 * m.margin;
     m.hintH = 0;
     {
-        static const wchar_t* zh = L"参数实时生效；取消勾选「启用 DLSSNR」为真正的直通。"
-                                    L"引擎跟不上时，可勾「丢帧保同步」或「降分辨率处理」。";
-        static const wchar_t* en = L"Live: uncheck Enable DLSSNR for a true pass-through. "
-                                    L"If the engine cannot keep up, use Drop late frames or Reduce resolution.";
         for (int lang = 0; lang < 2; ++lang) {
             RECT rc = { 0, 0, hintW, 0 };
-            DrawTextW(dc, lang ? en : zh, -1, &rc,
+            DrawTextW(dc, lang ? kDlssNrHintEn : kDlssNrHintZh, -1, &rc,
                       DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
             m.hintH = DlssNrMax2(m.hintH, rc.bottom - rc.top);
         }
         m.hintH += S(2);
     }
 
-    const int paramsH = m.segH + m.gap                                  // style row
-                      + (kDlssNrSliderCount + 1) * m.rowPitch           // sliders + processing res.
+    // The per-layer note under the strip, wrapped inside the page width and
+    // measured in both languages. It is where the UI says both "what the strip
+    // scopes" and "N layers cost N full passes", so it must not be the line that
+    // clips when the language changes.
+    m.layerNoteH = 0;
+    {
+        for (int lang = 0; lang < 2; ++lang) {
+            RECT rc = { 0, 0, hintW, 0 };
+            DrawTextW(dc, lang ? kDlssNrLayerNoteEn : kDlssNrLayerNoteZh, -1, &rc,
+                      DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+            m.layerNoteH = DlssNrMax2(m.layerNoteH, rc.bottom - rc.top);
+        }
+        m.layerNoteH += S(2);
+    }
+
+    const int paramsH = m.layerRowH + m.gap                             // count + current-layer strip
+                      + m.layerNoteH + m.gap                            // per-layer cost note
+                      + m.segH + m.gap                                  // style row
+                      + (kDlssNrSliderCount + 2) * m.rowPitch           // sliders + processing res. + extrapolation
+                      + m.segH + m.gap                                  // model row
                       + m.gap + 2 * m.rowH + m.gap / 2                  // two rows of checkboxes
                       + m.gap + m.segH                                  // actions
                       + m.gap + m.hintH;                                // hint
-    const int statusH = m.titleH + m.gap + 3 * m.lineH + 2 * S(4);
+    const int statusH = m.titleH + m.gap + 5 * m.lineH + 2 * S(4);
     m.pageH = DlssNrMax2(paramsH, statusH);
     m.wantH = m.margin + m.tabH + m.gap + m.pageH + m.margin;
 
@@ -666,6 +937,73 @@ static void DlssNrAttachHover(HWND h) {
     if (h) SetWindowSubclass(h, DlssNrHoverProc, 1, 0);
 }
 
+// The layer strip has two independent visibility inputs -- which page is up and
+// how many layers the chain has -- so it gets one function. A page switch that
+// blindly showed every strip button is exactly how the buttons of layers that
+// were just removed come back. It also owns the stepper's enabled state and the
+// N readout, because those change for the same two reasons.
+static void DlssNrSyncLayerStrip(DlssNrSettings* s) {
+    if (!s) return;
+    Engine& e = Engine::Instance();
+    const int n = e.OptLayerCount();
+    const int sel = e.OptSelLayer();
+    const bool pageVisible = (s->page == 0 || s->page == 2);
+    for (int i = 0; i < (int)dlssnr::kMaxLayers; ++i) {
+        HWND b = s->layerBtn[i];
+        if (!b) continue;
+        ShowWindow(b, (pageVisible && i < n) ? SW_SHOW : SW_HIDE);
+        // A one-layer chain has nothing to switch to. Keep the button visible and
+        // draw it inert instead of hiding it, so the feature stays discoverable
+        // for someone who has only ever run the single-layer default.
+        EnableWindow(b, (n > 1) ? TRUE : FALSE);
+        InvalidateRect(b, nullptr, FALSE);
+    }
+    EnableWindow(s->btnLayerMinus, (n > 1) ? TRUE : FALSE);
+    EnableWindow(s->btnLayerPlus,  (n < (int)dlssnr::kMaxLayers) ? TRUE : FALSE);
+    wchar_t t[16];
+    _snwprintf_s(t, _countof(t), _TRUNCATE, L"%d", n);
+    SetWindowTextW(s->lblLayerCount, t);
+    s->shownLayerCount = n;
+    s->shownSelLayer = sel;
+}
+
+// A model segment's label. The raw-id segment shows the id that is (or, while a
+// fixed segment is selected, would be) in effect, so the button explains itself
+// without a tooltip; the others are the table's names.
+static const wchar_t* DlssNrModelSegLabel(int seg, int cur, wchar_t* buf, int cch) {
+    if (seg == kDlssNrModelBtnCustom) {
+        const int id = (cur >= kDlssNrModelBtnCustom) ? dlssnr::ModelClamp(cur)
+                                                      : DlssNrModelCustomNext(cur);
+        if (g_uiLang == 1) _snwprintf_s(buf, (size_t)cch, _TRUNCATE, L"Preset %d", id);
+        else               _snwprintf_s(buf, (size_t)cch, _TRUNCATE, L"预设 %d", id);
+        return buf;
+    }
+    const dlssnr::ModelInfo* m = dlssnr::ModelFind(DlssNrModelSegmentPreset(seg, cur));
+    if (m) return (g_uiLang == 1) ? m->en : m->zh;
+    return L"";
+}
+
+// Enable the model segments for what the loaded nvngx_dlssnr.dll can actually
+// serve. Preset 0 (the DLL's default) and the raw-id segment are always usable;
+// a fixed segment whose resource this DLL does not carry is drawn INERT rather
+// than hidden -- the same choice the layer strip makes -- so the row keeps its
+// shape (a different DLL must not resize the panel) and the absence is visible
+// instead of silent. The status page's model line names what the DLL has.
+static void DlssNrSyncModelButtons(DlssNrSettings* s) {
+    if (!s) return;
+    dlssnr::DllWeight w[dlssnr::kDllWeightMax];
+    const int n = dlssnr::DllWeights(w, dlssnr::kDllWeightMax);
+    const int cur = Engine::Instance().OptModel();
+    for (int i = 0; i < kDlssNrModelBtnCount; ++i) {
+        if (!s->modelBtn[i]) continue;
+        const bool can = (i == kDlssNrModelBtnCustom) ||
+                         DlssNrModelAvailable(DlssNrModelSegmentPreset(i, cur), w, n);
+        EnableWindow(s->modelBtn[i], can ? TRUE : FALSE);
+        InvalidateRect(s->modelBtn[i], nullptr, FALSE);
+    }
+    s->shownModel = cur;
+}
+
 // ---- layout ----------------------------------------------------------------
 static void DlssNrLayout(DlssNrSettings* s) {
     const DlssNrMetrics& m = DlssNrGetMetrics();
@@ -690,6 +1028,26 @@ static void DlssNrLayout(DlssNrSettings* s) {
 
     // ---- parameters page ----
     y += m.tabH + m.gap;
+    // Layer row first: it scopes EVERYTHING under it (the style segments, the
+    // four sliders and the auto-mask box all edit the selected layer), so it has
+    // to read as the outermost control, not as a sidebar to the sliders.
+    {
+        const int ry = y + (m.layerRowH - m.rowH) / 2;
+        int cx = x0;
+        MoveWindow(s->lblLayerName, cx, ry, m.lblW, m.rowH, TRUE);          cx += m.lblW + m.gap;
+        MoveWindow(s->btnLayerMinus, cx, y, m.layerStepW, m.layerRowH, TRUE); cx += m.layerStepW;
+        MoveWindow(s->lblLayerCount, cx, ry, m.layerCountW, m.rowH, TRUE);    cx += m.layerCountW;
+        MoveWindow(s->btnLayerPlus, cx, y, m.layerStepW, m.layerRowH, TRUE);  cx += m.layerStepW + m.gap;
+        for (int i = 0; i < (int)dlssnr::kMaxLayers; ++i) {
+            MoveWindow(s->layerBtn[i], cx, y, m.layerBtnW, m.layerRowH, TRUE);
+            cx += m.layerBtnW + m.btnGap;
+        }
+    }
+    y += m.layerRowH + m.gap;
+    MoveWindow(s->lblLayerNote, x0, y, right - x0, m.layerNoteH, TRUE);
+    y += m.layerNoteH + m.gap;
+
+    // ---- style row ----
     int x = x0 + m.lblW + m.gap;
     for (int i = 0; i < kDlssNrStyleCount; ++i) {
         MoveWindow(s->styleBtn[i], x, y, m.styleW, m.segH, TRUE);
@@ -713,9 +1071,38 @@ static void DlssNrLayout(DlssNrSettings* s) {
         int cx = x0;
         MoveWindow(s->lblProc, cx, ry, m.lblW, m.rowH, TRUE);  cx += m.lblW + m.gap;
         MoveWindow(s->trkProc, cx, ry, m.barW, m.rowH, TRUE);  cx += m.barW + m.gap;
-        MoveWindow(s->valProc, cx, ry, m.valW + m.gap + m.rstW, m.rowH, TRUE);
+        MoveWindow(s->valProc, cx, ry, m.valW, m.rowH, TRUE);  cx += m.valW + m.gap;
+        MoveWindow(s->rstProc, cx, ry, m.rstW, m.rowH, TRUE);
     }
-    y = rowTop + (kDlssNrSliderCount + 1) * m.rowPitch + m.gap;
+    // The extrapolation row: label / slider / readout, directly under the
+    // processing-resolution row because both are session-level knobs that are
+    // not per-layer parameters.
+    {
+        const int ry = rowTop + (kDlssNrSliderCount + 1) * m.rowPitch
+                     + (m.rowPitch - m.rowH) / 2;
+        int cx = x0;
+        MoveWindow(s->lblExtrap, cx, ry, m.lblW, m.rowH, TRUE);  cx += m.lblW + m.gap;
+        MoveWindow(s->trkExtrap, cx, ry, m.barW, m.rowH, TRUE);  cx += m.barW + m.gap;
+        MoveWindow(s->valExtrap, cx, ry, m.valW, m.rowH, TRUE);  cx += m.valW + m.gap;
+        MoveWindow(s->rstExtrap, cx, ry, m.rstW, m.rowH, TRUE);
+    }
+    y = rowTop + (kDlssNrSliderCount + 2) * m.rowPitch + m.gap;
+
+    // ---- model row: which network inside nvngx_dlssnr.dll ----
+    // Session-level exactly like the processing-resolution row above it (both are
+    // feature-creation settings that rebuild the session), so it sits next to it
+    // rather than among the per-layer controls.
+    {
+        const int ry = y + (m.segH - m.rowH) / 2;
+        int cx = x0;
+        MoveWindow(s->lblModel, cx, ry, m.lblW, m.rowH, TRUE);
+        cx += m.lblW + m.gap;
+        for (int i = 0; i < kDlssNrModelBtnCount; ++i) {
+            MoveWindow(s->modelBtn[i], cx, y, m.modelBtnW, m.segH, TRUE);
+            cx += m.modelBtnW + m.btnGap;
+        }
+    }
+    y += m.segH + m.gap;
 
     HWND checks[5] = { s->chkEnable, s->chkAutoMask, s->chkDrop, s->chkProc, s->chkAutoshow };
     x = x0;                                   // row 1: what the picture looks like
@@ -745,7 +1132,9 @@ static void DlssNrLayout(DlssNrSettings* s) {
     sy += m.titleH + m.gap;
     MoveWindow(s->lblSub,   x0, sy, right - x0, m.lineH, TRUE); sy += m.lineH + m.gap;
     MoveWindow(s->lblStats, x0, sy, right - x0, m.lineH, TRUE); sy += m.lineH + m.gap;
-    MoveWindow(s->lblGeom,  x0, sy, right - x0, m.lineH, TRUE);
+    MoveWindow(s->lblGeom,  x0, sy, right - x0, m.lineH, TRUE); sy += m.lineH + m.gap;
+    MoveWindow(s->lblLayers, x0, sy, right - x0, m.lineH, TRUE); sy += m.lineH + m.gap;
+    MoveWindow(s->lblModelLine, x0, sy, right - x0, m.lineH, TRUE);
 
     // ---- page visibility (the compare page has no controls of its own) ----
     // The compare page ALSO shows the parameter controls: the whole point is to drag a
@@ -765,7 +1154,28 @@ static void DlssNrLayout(DlssNrSettings* s) {
     ShowWindow(s->lblProc, show);
     ShowWindow(s->trkProc, show);
     ShowWindow(s->valProc, show);
+    // Same trap as the three lines above: leave these out and the extrapolation
+    // row paints itself across the status page.
+    ShowWindow(s->lblExtrap, show);
+    ShowWindow(s->trkExtrap, show);
+    ShowWindow(s->valExtrap, show);
+    ShowWindow(s->rstProc, show);
+    ShowWindow(s->rstExtrap, show);
+    // The model row belongs to the parameter page too, for the same reason the
+    // processing-resolution row does. Its segments are ENABLED per what the loaded
+    // DLL carries (DlssNrSyncModelButtons), not shown/hidden: the row must keep
+    // its shape so a different DLL cannot resize the panel.
+    ShowWindow(s->lblModel, show);
+    for (int i = 0; i < kDlssNrModelBtnCount; ++i) ShowWindow(s->modelBtn[i], show);
     for (HWND h : checks) ShowWindow(h, show);
+    // The layer row belongs to the parameter page (and to the compare page, which
+    // shares it). The strip buttons themselves are shown per layer COUNT by
+    // DlssNrSyncLayerStrip(), so they are deliberately not in this group.
+    ShowWindow(s->lblLayerName, show);
+    ShowWindow(s->lblLayerCount, show);
+    ShowWindow(s->btnLayerMinus, show);
+    ShowWindow(s->btnLayerPlus, show);
+    ShowWindow(s->lblLayerNote, show);
     ShowWindow(s->btnResetAll, show);
     ShowWindow(s->btnRecheck, show);
     ShowWindow(s->btnLog, show);
@@ -775,16 +1185,17 @@ static void DlssNrLayout(DlssNrSettings* s) {
     ShowWindow(s->lblSub, statusShow);
     ShowWindow(s->lblStats, statusShow);
     ShowWindow(s->lblGeom, statusShow);
+    ShowWindow(s->lblLayers, statusShow);
+    ShowWindow(s->lblModelLine, statusShow);
+    DlssNrSyncLayerStrip(s);
+    DlssNrSyncModelButtons(s);
 }
 
 // ---- text ------------------------------------------------------------------
 static COLORREF g_statusColour = RGB(0x96, 0x96, 0x96);
 
 static const wchar_t* DlssNrHintText() {
-    return T(L"参数实时生效；取消勾选「启用 DLSSNR」为真正的直通。"
-             L"引擎跟不上时，可勾「丢帧保同步」或「降分辨率处理」。",
-             L"Live: uncheck Enable DLSSNR for a true pass-through. "
-             L"If the engine cannot keep up, use Drop late frames or Reduce resolution.");
+    return T(kDlssNrHintZh, kDlssNrHintEn);
 }
 
 // Defined with the compare window further down; the panel re-titles that window on a
@@ -801,6 +1212,10 @@ static void DlssNrRetext(HWND hwnd) {
     SetWindowTextW(s->lbl[2], T(L"局部结构", L"Local structure"));
     SetWindowTextW(s->lbl[3], T(L"皮肤结构", L"Skin structure"));
     SetWindowTextW(s->lblProc, T(kDlssNrProcLblZh, kDlssNrProcLblEn));
+    SetWindowTextW(s->lblExtrap, T(kDlssNrExtrapLblZh, kDlssNrExtrapLblEn));
+    SetWindowTextW(s->lblModel, T(kDlssNrModelLblZh, kDlssNrModelLblEn));
+    SetWindowTextW(s->lblLayerName, T(kDlssNrLayersLblZh, kDlssNrLayersLblEn));
+    SetWindowTextW(s->lblLayerNote, T(kDlssNrLayerNoteZh, kDlssNrLayerNoteEn));
     SetWindowTextW(s->lblHint, DlssNrHintText());
     if (s->compareWnd) {
         SetWindowTextW(s->compareWnd, DlssNrCompareTitle());
@@ -826,12 +1241,34 @@ static const wchar_t* DlssNrButtonLabel(int id) {
     case IDC_DLS_RECHECK:   return T(L"重新检测", L"Recheck");
     case IDC_DLS_LOG:       return T(L"打开日志", L"Open log");
     case IDC_DLS_CLOSE:     return L"\x00D7";      // x (U+00D7: in every UI font)
+    case IDC_DLS_LCOUNT_MINUS: return L"-";   // ASCII: present in every UI font
+    case IDC_DLS_LCOUNT_PLUS:  return L"+";
     default: break;
     }
     if (id >= IDC_DLS_STYLE0 && id < IDC_DLS_STYLE0 + kDlssNrStyleCount)
         return DlssNrStyleName(id - IDC_DLS_STYLE0);
+    if (id >= IDC_DLS_MODEL0 && id < IDC_DLS_MODEL0 + kDlssNrModelBtnCount) {
+        // The raw-id segment's label depends on what the panel currently holds, so
+        // it needs static storage: the label is read while the button paints, and
+        // returning a pointer into a local would dangle immediately -- the same
+        // reason the layer digits below are static.
+        static wchar_t modelLabel[kDlssNrModelBtnCount][24];
+        const int seg = id - IDC_DLS_MODEL0;
+        return DlssNrModelSegLabel(seg, Engine::Instance().OptModel(),
+                                   modelLabel[seg], _countof(modelLabel[seg]));
+    }
+    if (id >= IDC_DLS_LAYER0 && id < IDC_DLS_LAYER0 + (int)dlssnr::kMaxLayers) {
+        // A digit per layer. Static storage: the label is read while the button
+        // paints, and returning a pointer into a local would dangle immediately.
+        static wchar_t digits[dlssnr::kMaxLayers][4];
+        const int i = id - IDC_DLS_LAYER0;
+        _snwprintf_s(digits[i], _countof(digits[i]), _TRUNCATE, L"%d", i + 1);
+        return digits[i];
+    }
     if (id >= IDC_DLS_RST0 && id < IDC_DLS_RST0 + kDlssNrSliderCount * 10 &&
         (id - IDC_DLS_RST0) % 10 == 0)
+        return T(L"重置", L"Reset");
+    if (id == IDC_DLS_PROCRST || id == IDC_DLS_EXTRAPRST)
         return T(L"重置", L"Reset");
     return L"";
 }
@@ -845,6 +1282,7 @@ static void DlssNrRefreshStatus(HWND hwnd) {
         SetWindowTextW(s->lblSub,   T(L"共享内存不可用", L"Shared memory unavailable"));
         SetWindowTextW(s->lblStats, L"");
         SetWindowTextW(s->lblGeom,  L"");
+        SetWindowTextW(s->lblLayers, L"");
         InvalidateRect(s->lblTitle, nullptr, TRUE);
         return;
     }
@@ -896,6 +1334,76 @@ static void DlssNrRefreshStatus(HWND hwnd) {
                  (int)sh->videoW, (int)sh->videoH, DlssNrFmtName((int)sh->inputBpp),
                  pct, pw, ph2, (double)sh->dropLagMs);
     SetWindowTextW(s->lblGeom, buf);
+
+    // Configured vs actually built. They differ for the frame or two between
+    // raising the count and the next frame creating the extra NGX features, and
+    // that gap is exactly what "the chain is N passes" needs to be checked
+    // against. Read from the in-process engine, not the shared block: the panel
+    // drives this engine directly and can change it while a paused graph is not
+    // publishing telemetry at all.
+    const int nCfg  = en.OptLayerCount();
+    const int nLive = dlssnr::ActiveLayers();
+    _snwprintf_s(buf, _countof(buf), _TRUNCATE,
+                 T(L"层: 配置 %d 层 / 引擎已建 %d 层    每层是一次完整推理",
+                   L"Layers: %d configured / %d built    one full pass per layer"),
+                 nCfg, nLive);
+    SetWindowTextW(s->lblLayers, buf);
+
+    // Which network inside nvngx_dlssnr.dll this session is running. Three facts
+    // in one line, because "the switch did nothing" has three different causes and
+    // the line has to tell them apart:
+    //   * the DLL's version and the resources it actually carries (the panel's
+    //     segments are enabled from the same scan, so a greyed-out segment has a
+    //     stated reason here),
+    //   * the request (panel/ini) and what the engine APPLIED -- they differ when
+    //     the DLL refused the preset and the engine fell back to its default.
+    {
+        wchar_t ver[32] = L"";
+        dlssnr::DllVersion(ver, _countof(ver));
+        dlssnr::DllWeight w[dlssnr::kDllWeightMax];
+        const int nw = dlssnr::DllWeights(w, dlssnr::kDllWeightMax);
+        wchar_t list[160] = L"";
+        for (int i = 0; i < nw; ++i) {
+            const wchar_t* nm = L"";
+            wchar_t tmp[64];
+            // Show the short panel name when the table knows the resource, and the
+            // resource's own tail when it does not -- an unknown network must be
+            // visible, because that is the one a raw preset id can select.
+            if (w[i].preset >= 0) nm = DlssNrModelSegLabel(
+                (w[i].preset < kDlssNrModelBtnCustom) ? w[i].preset : kDlssNrModelBtnCustom,
+                w[i].preset, tmp, _countof(tmp));
+            else {
+                const char* tail = w[i].name;
+                const char* us = strrchr(w[i].name, '_');
+                if (us && us[1]) tail = us + 1;
+                _snwprintf_s(tmp, _countof(tmp), _TRUNCATE, L"%hs", tail);
+                nm = tmp;
+            }
+            if (list[0]) wcscat_s(list, L", ");
+            wcscat_s(list, nm);
+        }
+        // NOTE: take the RETURNED pointer, not the buffer. A fixed segment returns
+        // its table label and never touches `buf`, so printing the buffer here
+        // printed uninitialised stack -- which is exactly how this line first came
+        // out as two garbage code units instead of "自动".
+        wchar_t reqBuf[32], appBuf[32];
+        const int reqSeg = (en.OptModel() < kDlssNrModelBtnCustom)
+                               ? en.OptModel() : kDlssNrModelBtnCustom;
+        const int appSeg = (en.AppliedModel() < kDlssNrModelBtnCustom)
+                               ? en.AppliedModel() : kDlssNrModelBtnCustom;
+        const wchar_t* reqLbl = DlssNrModelSegLabel(reqSeg, en.OptModel(),
+                                                    reqBuf, _countof(reqBuf));
+        const wchar_t* appLbl = DlssNrModelSegLabel(appSeg, en.AppliedModel(),
+                                                    appBuf, _countof(appBuf));
+        _snwprintf_s(buf, _countof(buf), _TRUNCATE,
+                     T(L"模型: %s (%d)    引擎实际: %s (%d)%s    DLL %s 网络: %s",
+                       L"Model: %s (%d)    applied: %s (%d)%s    DLL %s nets: %s"),
+                     reqLbl, en.OptModel(), appLbl, en.AppliedModel(),
+                     en.ModelFellBack() ? T(L"  (!) 该 DLL 拒绝了请求，已回退",
+                                            L"  (!) DLL refused, fell back") : L"",
+                     ver[0] ? ver : L"?", list[0] ? list : T(L"未检测到", L"none found"));
+        SetWindowTextW(s->lblModelLine, buf);
+    }
 }
 
 static void DlssNrRefreshControls(HWND hwnd) {
@@ -916,6 +1424,17 @@ static void DlssNrRefreshControls(HWND hwnd) {
         SetWindowTextW(s->valProc, t);
         InvalidateRect(s->trkProc, nullptr, FALSE);
     }
+    {
+        const int ex = e.OptExtrap();
+        SendMessageW(s->trkExtrap, TBM_SETPOS, TRUE, ex);
+        wchar_t t[16];
+        // 100 % reads as "off", because that is what it is -- the row must not
+        // look like a second strength control that is merely at its default.
+        if (ex == 100) _snwprintf_s(t, _countof(t), _TRUNCATE, L"%s", T(L"关", L"off"));
+        else           _snwprintf_s(t, _countof(t), _TRUNCATE, L"%d%%", ex);
+        SetWindowTextW(s->valExtrap, t);
+        InvalidateRect(s->trkExtrap, nullptr, FALSE);
+    }
     DlssNrSetChecked(s->chkAutoshow, DlssNrAutoshow());
     const float v[kDlssNrSliderCount] = {
         e.OptIntensity(), e.OptTone(), e.OptStruct(), e.OptSkin() };
@@ -929,6 +1448,34 @@ static void DlssNrRefreshControls(HWND hwnd) {
     }
     s->shownStyle = e.OptStyle();
     for (int i = 0; i < kDlssNrStyleCount; ++i) InvalidateRect(s->styleBtn[i], nullptr, FALSE);
+    // Which layer the controls above were just loaded from, and the count/strip
+    // that go with it. Kept last so the strip highlight matches the values.
+    DlssNrSyncLayerStrip(s);
+}
+
+// Grow or shrink the chain from the UI. SetLayerCount() only records the new
+// count -- the extra NGX features are built lazily on the next frame -- so the
+// panel's on-screen values go stale the moment this runs: growing copies the
+// last layer into the new slots INSIDE the engine, and those copies are what the
+// user must now see. Hence refresh + persist + tell a paused frame to re-render.
+static void DlssNrSetLayerCountFromUi(HWND hwnd, int n) {
+    DlssNrSettings* s = (DlssNrSettings*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (!s) return;
+    Engine& e = Engine::Instance();
+    const int oldCount = e.OptLayerCount();
+    n = n < 1 ? 1 : (n > (int)dlssnr::kMaxLayers ? (int)dlssnr::kMaxLayers : n);
+    if (n == oldCount) return;
+    e.SetLayerCount(n);
+    // Growing means "do that again, a bit softer", not "keep editing the old
+    // one": the engine already copied the last layer into the new slots, so make
+    // the top one current. Shrinking keeps the selection the engine clamped.
+    if (n > oldCount) e.SetSelLayer(n - 1);
+    DlssNrWriteLayers();          // layers=N + every active layer's six keys
+    DlssNrRefreshControls(hwnd);  // the new slots hold copies: never show stale rows
+    DlssNrRefreshSinks(true);     // a paused graph must build the extra features
+    if (s->onChanged) s->onChanged(s->onChangedCtx);
+    HWND par = GetParent(hwnd);
+    if (par) PostMessageW(par, DLS_N_CHANGED, 0, 0);
 }
 
 static void DlssNrPush(HWND hwnd, bool persist) {
@@ -1255,6 +1802,41 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                              0, 0, 0, 0, hwnd,
                                              (HMENU)(INT_PTR)(IDC_DLS_STYLE0 + i), g_hModule, nullptr);
         }
+        // The model row: which network inside nvngx_dlssnr.dll. All four segments
+        // are created visible; DlssNrSyncModelButtons() decides which of them the
+        // loaded DLL can serve and draws the rest inert.
+        s->lblModel = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                      0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_MODELLBL,
+                                      g_hModule, nullptr);
+        for (int i = 0; i < kDlssNrModelBtnCount; ++i) {
+            s->modelBtn[i] = CreateWindowExW(0, L"BUTTON", L"",
+                                             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                             0, 0, 0, 0, hwnd,
+                                             (HMENU)(INT_PTR)(IDC_DLS_MODEL0 + i), g_hModule, nullptr);
+        }
+        // Layer count stepper + the 1..N strip. The strip buttons are created
+        // WITHOUT WS_VISIBLE: only the first `count` of them may ever show, and
+        // DlssNrSyncLayerStrip() owns that decision (page AND count).
+        s->lblLayerName = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                          0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_LAYERNAME, g_hModule, nullptr);
+        s->btnLayerMinus = CreateWindowExW(0, L"BUTTON", L"",
+                                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                           0, 0, 0, 0, hwnd,
+                                           (HMENU)(INT_PTR)IDC_DLS_LCOUNT_MINUS, g_hModule, nullptr);
+        s->lblLayerCount = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_CENTER,
+                                           0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_LAYERCOUNT, g_hModule, nullptr);
+        s->btnLayerPlus = CreateWindowExW(0, L"BUTTON", L"",
+                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                          0, 0, 0, 0, hwnd,
+                                          (HMENU)(INT_PTR)IDC_DLS_LCOUNT_PLUS, g_hModule, nullptr);
+        for (int i = 0; i < (int)dlssnr::kMaxLayers; ++i) {
+            s->layerBtn[i] = CreateWindowExW(0, L"BUTTON", L"",
+                                             WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
+                                             0, 0, 0, 0, hwnd,
+                                             (HMENU)(INT_PTR)(IDC_DLS_LAYER0 + i), g_hModule, nullptr);
+        }
+        s->lblLayerNote = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                          0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_LAYERNOTE, g_hModule, nullptr);
         for (int i = 0; i < kDlssNrSliderCount; ++i) {
             const int base = IDC_DLS_LBL0 + i * 10;
             s->lbl[i] = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
@@ -1263,7 +1845,7 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
                                         0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)(base + 1), g_hModule, nullptr);
             SendMessageW(s->trk[i], TBM_SETRANGE, TRUE, MAKELPARAM(0, kDlssNrSliderMax[i]));
-            SendMessageW(s->trk[i], TBM_SETPOS, TRUE, kDlssNrSliderDef[i]);
+            SendMessageW(s->trk[i], TBM_SETPOS, TRUE, DlssNrSliderDefault(i));
             SetWindowSubclass(s->trk[i], DlssNrSliderProc, 0, 0);
             s->val[i] = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_RIGHT,
                                         0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)(base + 2), g_hModule, nullptr);
@@ -1284,6 +1866,23 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetWindowSubclass(s->trkProc, DlssNrSliderProc, 0, 0);
         s->valProc = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_RIGHT,
                                      0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_PROCVAL, g_hModule, nullptr);
+        // Extrapolation: a gain, so 100 % is the floor and means off.
+        s->lblExtrap = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                       0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_EXTRAPLBL, g_hModule, nullptr);
+        s->trkExtrap = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
+                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
+                                       0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_EXTRAPTRK, g_hModule, nullptr);
+        SendMessageW(s->trkExtrap, TBM_SETRANGE, TRUE, MAKELPARAM(100, 400));
+        SendMessageW(s->trkExtrap, TBM_SETLINESIZE, 0, 10);
+        SendMessageW(s->trkExtrap, TBM_SETPAGESIZE, 0, 10);
+        SetWindowSubclass(s->trkExtrap, DlssNrSliderProc, 0, 0);
+        s->valExtrap = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_RIGHT,
+                                       0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_EXTRAPVAL, g_hModule, nullptr);
+        // Reset buttons for the two global rows, same owner-draw shape as rst[i].
+        s->rstProc = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                     0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_PROCRST, g_hModule, nullptr);
+        s->rstExtrap = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                       0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_EXTRAPRST, g_hModule, nullptr);
         s->chkEnable = CreateWindowExW(0, L"BUTTON", L"",
                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                                        0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_ENABLE, g_hModule, nullptr);
@@ -1323,6 +1922,11 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                       0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_STATS, g_hModule, nullptr);
         s->lblGeom  = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
                                       0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_GEOM, g_hModule, nullptr);
+        s->lblLayers = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                       0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_LAYERS, g_hModule, nullptr);
+        s->lblModelLine = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS,
+                                          0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_MODELLINE,
+                                          g_hModule, nullptr);
         s->lblHint  = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
                                       0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_HINT, g_hModule, nullptr);
 
@@ -1332,10 +1936,18 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                        s->lbl[1], s->trk[1], s->val[1], s->rst[1],
                        s->lbl[2], s->trk[2], s->val[2], s->rst[2],
                        s->lbl[3], s->trk[3], s->val[3], s->rst[3],
+                       s->lblLayerName, s->lblLayerCount, s->lblLayerNote,
+                       s->btnLayerMinus, s->btnLayerPlus,
+                       s->layerBtn[0], s->layerBtn[1], s->layerBtn[2], s->layerBtn[3],
+                       s->layerBtn[4], s->layerBtn[5], s->layerBtn[6], s->layerBtn[7],
                        s->chkEnable, s->chkAutoMask, s->chkDrop, s->chkProc, s->chkAutoshow,
                        s->lblProc, s->trkProc, s->valProc,
+        s->lblExtrap, s->trkExtrap, s->valExtrap,
+        s->rstProc, s->rstExtrap,
+                       s->lblModel, s->modelBtn[0], s->modelBtn[1], s->modelBtn[2], s->modelBtn[3],
                        s->btnResetAll, s->btnRecheck, s->btnLog,
-                       s->lblTitle, s->lblSub, s->lblStats, s->lblGeom, s->lblHint };
+                       s->lblTitle, s->lblSub, s->lblStats, s->lblGeom, s->lblLayers, s->lblHint,
+                       s->lblModelLine };
         for (HWND h : all) if (h) SendMessageW(h, WM_SETFONT, (WPARAM)s->font, TRUE);
         // Bold chrome, small type for the readouts, telemetry and hint.
         for (int i = 0; i < 2; ++i) {
@@ -1344,21 +1956,41 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         for (int i = 0; i < kDlssNrStyleCount; ++i)
             SendMessageW(s->styleBtn[i], WM_SETFONT, (WPARAM)s->fontBold, TRUE);
+        // The model row is chrome like the style row: caption and segments bold.
+        SendMessageW(s->lblModel, WM_SETFONT, (WPARAM)s->fontBold, TRUE);
+        for (int i = 0; i < kDlssNrModelBtnCount; ++i)
+            SendMessageW(s->modelBtn[i], WM_SETFONT, (WPARAM)s->fontBold, TRUE);
         for (int i = 0; i < kDlssNrSliderCount; ++i)
             SendMessageW(s->lbl[i], WM_SETFONT, (WPARAM)s->fontBold, TRUE);
         // the processing-resolution row is a slider row too, so its label is bold
         SendMessageW(s->lblProc, WM_SETFONT, (WPARAM)s->fontBold, TRUE);
+        SendMessageW(s->lblExtrap, WM_SETFONT, (WPARAM)s->fontBold, TRUE);
+        // The layer row is chrome: its caption, the N readout and the buttons are
+        // all bold like the other labels/segments.
+        SendMessageW(s->lblLayerName, WM_SETFONT, (WPARAM)s->fontBold, TRUE);
+        SendMessageW(s->lblLayerCount, WM_SETFONT, (WPARAM)s->fontBold, TRUE);
+        SendMessageW(s->btnLayerMinus, WM_SETFONT, (WPARAM)s->fontBold, TRUE);
+        SendMessageW(s->btnLayerPlus,  WM_SETFONT, (WPARAM)s->fontBold, TRUE);
+        for (int i = 0; i < (int)dlssnr::kMaxLayers; ++i)
+            SendMessageW(s->layerBtn[i], WM_SETFONT, (WPARAM)s->fontBold, TRUE);
         SendMessageW(s->lblTitle, WM_SETFONT, (WPARAM)s->fontBig, TRUE);
         // Plain array, not an initializer_list range-for: this header must
         // compile in a translation unit that does not include <initializer_list>.
         HWND smallType[] = { s->lblSub, s->lblStats, s->lblGeom, s->lblHint,
-                             s->val[0], s->val[1], s->val[2], s->val[3], s->valProc };
+                             s->lblLayerNote, s->lblLayers,
+                             s->val[0], s->val[1], s->val[2], s->val[3], s->valProc,
+                             s->valExtrap };
         for (HWND h : smallType) SendMessageW(h, WM_SETFONT, (WPARAM)s->fontSmall, TRUE);
 
         DlssNrAttachHover(s->tab[0]);   DlssNrAttachHover(s->tab[1]);
         DlssNrAttachHover(s->lang[0]);  DlssNrAttachHover(s->lang[1]);
         for (int i = 0; i < kDlssNrStyleCount; ++i) DlssNrAttachHover(s->styleBtn[i]);
+        DlssNrAttachHover(s->btnLayerMinus);
+        DlssNrAttachHover(s->btnLayerPlus);
+        for (int i = 0; i < (int)dlssnr::kMaxLayers; ++i) DlssNrAttachHover(s->layerBtn[i]);
         for (int i = 0; i < kDlssNrSliderCount; ++i) DlssNrAttachHover(s->rst[i]);
+        DlssNrAttachHover(s->rstProc);
+        DlssNrAttachHover(s->rstExtrap);
         DlssNrAttachHover(s->btnResetAll);
         DlssNrAttachHover(s->btnRecheck);
         DlssNrAttachHover(s->btnLog);
@@ -1450,8 +2082,13 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_DLS_LANG0:     active = (g_uiLang == 0); break;
         case IDC_DLS_LANG0 + 1: active = (g_uiLang == 1); break;
         default:
-            if (id >= IDC_DLS_STYLE0 && id < IDC_DLS_STYLE0 + kDlssNrStyleCount)
+            if (id >= IDC_DLS_LAYER0 && id < IDC_DLS_LAYER0 + (int)dlssnr::kMaxLayers)
+                active = (Engine::Instance().OptSelLayer() == id - IDC_DLS_LAYER0);
+            else if (id >= IDC_DLS_STYLE0 && id < IDC_DLS_STYLE0 + kDlssNrStyleCount)
                 active = (Engine::Instance().OptStyle() == id - IDC_DLS_STYLE0);
+            else if (id >= IDC_DLS_MODEL0 && id < IDC_DLS_MODEL0 + kDlssNrModelBtnCount)
+                active = DlssNrModelSegActive(id - IDC_DLS_MODEL0,
+                                              Engine::Instance().OptModel());
             break;
         }
         DlssNrDrawButton(di, DlssNrButtonLabel(id), active);
@@ -1463,8 +2100,9 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetBkMode(dc, TRANSPARENT);
         COLORREF col = kClrText;
         if (s) {
-            if ((HWND)lp == s->lblTitle)     col = g_statusColour;
-            else if ((HWND)lp == s->lblHint) col = kClrTextDim;
+            if ((HWND)lp == s->lblTitle)          col = g_statusColour;
+            else if ((HWND)lp == s->lblHint ||
+                     (HWND)lp == s->lblLayerNote) col = kClrTextDim;
         }
         SetTextColor(dc, col);
         return (LRESULT)DlssNrBrush(kClrBg);
@@ -1487,6 +2125,13 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             for (int i = 0; i < kDlssNrStyleCount; ++i)
                 InvalidateRect(s->styleBtn[i], nullptr, FALSE);
         }
+        if (s->shownModel != e.OptModel())         // ...and the model selection
+            DlssNrSyncModelButtons(s);             // sets shownModel and repaints
+        // The tray (or another copy of the panel) can change the chain too. A
+        // count change copies the last layer's values into the new slots, so a
+        // partial repaint is not enough: reload every control from the engine.
+        if (s->shownLayerCount != e.OptLayerCount() || s->shownSelLayer != e.OptSelLayer())
+            DlssNrRefreshControls(hwnd);
         DlssNrRefreshStatus(hwnd);
         return 0;
     }
@@ -1504,6 +2149,19 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(from, nullptr, FALSE);
             if (LOWORD(wp) == TB_ENDTRACK)
                 DlssNrApplyProcScale(DlssNrChecked(s->chkProc), pct, true);
+            return 0;
+        }
+        if (from == s->trkExtrap) {
+            // Live readout on every tick, applied on TB_ENDTRACK only: the gain
+            // is a shader constant, so an end-track apply is a picture that
+            // changes once per drag instead of strobing through every step.
+            const int gain = (int)SendMessageW(from, TBM_GETPOS, 0, 0);
+            wchar_t t[16];
+            if (gain == 100) _snwprintf_s(t, _countof(t), _TRUNCATE, L"%s", T(L"关", L"off"));
+            else             _snwprintf_s(t, _countof(t), _TRUNCATE, L"%d%%", gain);
+            SetWindowTextW(s->valExtrap, t);
+            InvalidateRect(from, nullptr, FALSE);
+            if (LOWORD(wp) == TB_ENDTRACK) DlssNrApplyExtrap(gain, true);
             return 0;
         }
         int idx = -1;
@@ -1544,6 +2202,20 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DlssNrLayout(s);
             return 0;
         }
+        if (id == IDC_DLS_LCOUNT_MINUS || id == IDC_DLS_LCOUNT_PLUS) {
+            const int cur = Engine::Instance().OptLayerCount();
+            DlssNrSetLayerCountFromUi(hwnd, cur + (id == IDC_DLS_LCOUNT_PLUS ? 1 : -1));
+            return 0;
+        }
+        if (id >= IDC_DLS_LAYER0 && id < IDC_DLS_LAYER0 + (int)dlssnr::kMaxLayers) {
+            // Selection only decides which layer the controls below edit. It is
+            // NOT a parameter change: pushing the on-screen values now would
+            // overwrite the layer just selected with the old layer's numbers, and
+            // there is nothing to write to the ini either. Reload from the engine.
+            Engine::Instance().SetSelLayer(id - IDC_DLS_LAYER0);
+            DlssNrRefreshControls(hwnd);
+            return 0;
+        }
         if (id >= IDC_DLS_STYLE0 && id < IDC_DLS_STYLE0 + kDlssNrStyleCount) {
             int pct[kDlssNrSliderCount];
             for (int i = 0; i < kDlssNrSliderCount; ++i)
@@ -1559,10 +2231,39 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (par) PostMessageW(par, DLS_N_CHANGED, 0, 0);
             return 0;
         }
+        if (id >= IDC_DLS_MODEL0 && id < IDC_DLS_MODEL0 + kDlssNrModelBtnCount) {
+            // A model change re-creates the session, so this behaves like the
+            // processing-resolution row and not like the sliders: apply, persist,
+            // and let the worker rebuild (frames pass through for that moment).
+            // The raw-id segment advances to the next id no fixed segment covers.
+            const int seg = id - IDC_DLS_MODEL0;
+            const int cur = Engine::Instance().OptModel();
+            const int preset = (seg == kDlssNrModelBtnCustom)
+                             ? DlssNrModelCustomNext(cur)
+                             : DlssNrModelSegmentPreset(seg, cur);
+            DlssNrApplyModel(preset, true);
+            DlssNrSyncModelButtons(s);
+            return 0;
+        }
+        if (id == IDC_DLS_PROCRST) {
+            // Documented default, not "off": the panel restores the value the
+            // switch was designed around, and leaves the switch itself alone --
+            // resetting a number must not silently enable a feature.
+            SendMessageW(s->trkProc, TBM_SETPOS, TRUE, 50);
+            DlssNrApplyProcScale(DlssNrChecked(s->chkProc), 50, true);
+            DlssNrRefreshControls(hwnd);
+            return 0;
+        }
+        if (id == IDC_DLS_EXTRAPRST) {
+            SendMessageW(s->trkExtrap, TBM_SETPOS, TRUE, 100);
+            DlssNrApplyExtrap(100, true);          // 100 = off
+            DlssNrRefreshControls(hwnd);
+            return 0;
+        }
         if (id >= IDC_DLS_RST0 && id < IDC_DLS_RST0 + kDlssNrSliderCount * 10 &&
             (id - IDC_DLS_RST0) % 10 == 0) {
             const int i = (id - IDC_DLS_RST0) / 10;
-            SendMessageW(s->trk[i], TBM_SETPOS, TRUE, kDlssNrSliderDef[i]);
+            SendMessageW(s->trk[i], TBM_SETPOS, TRUE, DlssNrSliderDefault(i));
             InvalidateRect(s->trk[i], nullptr, FALSE);
             DlssNrPush(hwnd, true);
             return 0;
@@ -1588,15 +2289,35 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (id == IDC_DLS_RESETALL) {
-            DlssNrApply(true, 0, kDlssNrSliderDef[0], kDlssNrSliderDef[1],
-                        kDlssNrSliderDef[2], kDlssNrSliderDef[3], false, true);
+            // Back to the DOCUMENTED defaults -- and `layers` is one of them
+            // ("layers=1 ... a single pass, which is exactly how every version
+            // before layers existed behaved", see app\dlssnr_dshow.ini.template).
+            // Leaving the chain at three passes would not be a reset; the - half
+            // of the stepper is not the only way back. This reverses the first
+            // draft of this button, which deliberately kept the count.
+            //
+            // Order matters: shrink FIRST. SetLayerCount() clamps the selection,
+            // so the DlssNrApply() below lands on layer 1, and the `layers=1` it
+            // writes describes the chain we just collapsed to.
+            //
+            // The stored settings of layers 2..8 are deliberately NOT wiped: they
+            // are inactive, and the documented behaviour is that a layer's keys
+            // stay put until that layer is used again (the panel's + copies the
+            // last layer in, so they are never resurrected by accident).
+            Engine::Instance().SetLayerCount(1);
+            const dlssnr::LayerCfg d = dlssnr::LayerDefault();
+            DlssNrApply(true, d.style, d.pctIntensity, d.pctTone, d.pctStruct,
+                        d.pctSkin, d.autoMask != 0, true);
+            LogRaw("ui: reset to defaults (layer 1 of 1 back to documented defaults)");
             DlssNrSetChecked(s->chkEnable, true);
-            DlssNrSetChecked(s->chkAutoMask, false);
+            DlssNrSetChecked(s->chkAutoMask, d.autoMask != 0);
             DlssNrSetChecked(s->chkDrop, true);       // dropping is the default
             DlssNrApplyDrop(true, true);
             DlssNrSetChecked(s->chkProc, false);      // reduced resolution is opt-in
             SendMessageW(s->trkProc, TBM_SETPOS, TRUE, 50);
             DlssNrApplyProcScale(false, 50, true);    // 50% = the value it restores to
+            SendMessageW(s->trkExtrap, TBM_SETPOS, TRUE, 100);
+            DlssNrApplyExtrap(100, true);             // 100 = off
             DlssNrRefreshControls(hwnd);
             if (s->onChanged) s->onChanged(s->onChangedCtx);
             HWND par = GetParent(hwnd);
@@ -1791,6 +2512,9 @@ enum {
     IDM_DLS_STRUCT   = 400,     // +0..4
     IDM_DLS_SKIN     = 500,     // +0..4 (kDlssNrPct presets)
     IDM_DLS_AUTOMASK = 600,
+    IDM_DLS_LAYERCOUNT = 700,   // +0..kMaxLayers-1: 1..8 passes per frame
+    IDM_DLS_SELLAYER   = 720,   // +0..kMaxLayers-1: which layer is edited
+    IDM_DLS_MODEL      = 740,   // +preset: which network inside nvngx_dlssnr.dll
 };
 
 // Whether opening a video should pop the control panel automatically. Read from
@@ -2005,6 +2729,34 @@ private:
         AppendMenuW(m, MF_STRING | (e.OptEnabled() ? MF_CHECKED : 0),
                     IDM_DLS_ENABLE, T(L"启用 DLSSNR", L"Enable DLSSNR"));
 
+        // 层数 / Layers: the chain length. Built fresh on every open so the check
+        // mark follows the live engine (which the panel can change too).
+        HMENU lc = CreatePopupMenu();
+        for (int i = 1; i <= (int)dlssnr::kMaxLayers; ++i) {
+            wchar_t t[32];
+            if (g_uiLang == 1)
+                _snwprintf_s(t, _countof(t), _TRUNCATE, i == 1 ? L"%d layer" : L"%d layers", i);
+            else
+                _snwprintf_s(t, _countof(t), _TRUNCATE, L"%d 层", i);
+            AppendMenuW(lc, MF_STRING | (e.OptLayerCount() == i ? MF_CHECKED : 0),
+                        (UINT_PTR)(IDM_DLS_LAYERCOUNT + i - 1), t);
+        }
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)lc, T(L"层数", L"Layers"));
+
+        // 编辑层 / Edit layer: only the ACTIVE layers. Layer 5 of a 3-layer chain
+        // is not something the engine could be asked to edit.
+        HMENU sel = CreatePopupMenu();
+        const int selCount = e.OptLayerCount() < (int)dlssnr::kMaxLayers
+                           ? e.OptLayerCount() : (int)dlssnr::kMaxLayers;
+        for (int i = 0; i < selCount; ++i) {
+            wchar_t t[32];
+            _snwprintf_s(t, _countof(t), _TRUNCATE,
+                         g_uiLang == 1 ? L"Layer %d" : L"第 %d 层", i + 1);
+            AppendMenuW(sel, MF_STRING | (e.OptSelLayer() == i ? MF_CHECKED : 0),
+                        (UINT_PTR)(IDM_DLS_SELLAYER + i), t);
+        }
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)sel, T(L"编辑层", L"Edit layer"));
+
         static const wchar_t* zhStyle[4] = { L"默认", L"自然", L"电影", L"风格3" };
         static const wchar_t* enStyle[4] = { L"Default", L"Natural", L"Cinema", L"Style 3" };
         HMENU st = CreatePopupMenu();
@@ -2013,6 +2765,32 @@ private:
                         (UINT_PTR)(IDM_DLS_STYLE + i),
                         (g_uiLang == 1 ? enStyle : zhStyle)[i]);
         AppendMenuW(m, MF_POPUP, (UINT_PTR)st, T(L"风格", L"Style"));
+        // Which network inside nvngx_dlssnr.dll, the same choices the panel's
+        // model row offers. A popup cannot "cycle" the way a panel segment can, so
+        // the raw ids get one item each (and a greyed-out fixed entry means this
+        // DLL does not carry that network, exactly like the inert segment).
+        {
+            HMENU md = CreatePopupMenu();
+            dlssnr::DllWeight wts[dlssnr::kDllWeightMax];
+            const int nw = dlssnr::DllWeights(wts, dlssnr::kDllWeightMax);
+            wchar_t lbl[32];
+            for (int seg = 0; seg < kDlssNrModelBtnCustom; ++seg) {
+                const bool can = DlssNrModelAvailable(DlssNrModelSegmentPreset(seg, e.OptModel()),
+                                                      wts, nw);
+                AppendMenuW(md, MF_STRING | (e.OptModel() == seg ? MF_CHECKED : 0) |
+                                (can ? 0 : MF_GRAYED),
+                            (UINT_PTR)(IDM_DLS_MODEL + seg),
+                            DlssNrModelSegLabel(seg, e.OptModel(), lbl, _countof(lbl)));
+            }
+            AppendMenuW(md, MF_SEPARATOR, 0, nullptr);
+            for (int id = kDlssNrModelBtnCustom; id <= (int)dlssnr::kMaxModelPreset; ++id) {
+                if (g_uiLang == 1) _snwprintf_s(lbl, _countof(lbl), _TRUNCATE, L"Preset %d", id);
+                else               _snwprintf_s(lbl, _countof(lbl), _TRUNCATE, L"预设 %d", id);
+                AppendMenuW(md, MF_STRING | (e.OptModel() == id ? MF_CHECKED : 0),
+                            (UINT_PTR)(IDM_DLS_MODEL + id), lbl);
+            }
+            AppendMenuW(m, MF_POPUP, (UINT_PTR)md, T(L"模型", L"Model"));
+        }
         AppendPctMenuEx(m, T(L"强度", L"Intensity"), IDM_DLS_INT,
                         DlssNrPctMax(e.OptIntensity(), kDlssNrSliderMax[0]),
                         kDlssNrPct100, kDlssNrPctCount);
@@ -2054,6 +2832,26 @@ private:
         if (cmd == IDM_DLS_ENABLE)  { DlssNrApply(!e.OptEnabled(), e.OptStyle(), Pct(e.OptIntensity()), Pct(e.OptTone()), Pct(e.OptStruct()), Pct(e.OptSkin()), e.OptAutoMask(), true); UpdateTip(); return; }
         if (cmd == IDM_DLS_AUTOMASK){ DlssNrApply(e.OptEnabled(), e.OptStyle(), Pct(e.OptIntensity()), Pct(e.OptTone()), Pct(e.OptStruct()), Pct(e.OptSkin()), !e.OptAutoMask(), true); return; }
         if (cmd == IDM_DLS_DROP)    { DlssNrApplyDrop(!e.OptDropFrames(), true); return; }
+        if (cmd >= IDM_DLS_LAYERCOUNT && cmd < IDM_DLS_LAYERCOUNT + (int)dlssnr::kMaxLayers) {
+            e.SetLayerCount(cmd - IDM_DLS_LAYERCOUNT + 1);
+            // No "current layer" edit happened, so persist the whole chain: the
+            // count plus every value, including the copy SetLayerCount() just made
+            // into the new slots.
+            DlssNrWriteLayers();
+            DlssNrRefreshSinks(true);   // a paused graph must build the extra features
+            UpdateTip();
+            return;
+        }
+        if (cmd >= IDM_DLS_SELLAYER && cmd < IDM_DLS_SELLAYER + (int)dlssnr::kMaxLayers) {
+            // Only the edit target changes; nothing to push and nothing to write.
+            // An open panel picks the new selection up on its next timer tick.
+            e.SetSelLayer(cmd - IDM_DLS_SELLAYER);
+            return;
+        }
+        if (cmd >= IDM_DLS_MODEL && cmd <= IDM_DLS_MODEL + (int)dlssnr::kMaxModelPreset) {
+            DlssNrApplyModel(cmd - IDM_DLS_MODEL, true);
+            return;
+        }
         if (cmd == IDM_DLS_SETTINGS){ OpenSettings(); return; }
         if (cmd == IDM_DLS_AUTOSHOW) {
             bool now = !DlssNrAutoshow();

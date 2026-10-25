@@ -48,13 +48,15 @@ echo === building dlssnr_dshow.dll (with the built-in GPU engine) ===
 call "%VCVARS%" >nul 2>&1
 REM gdi32: the tray icon is drawn at runtime.  comctl32: TRACKBAR.  shell32:
 REM Shell_NotifyIcon.  uuid: the IPropertyPage / IPropertyPageSite IIDs.
+REM version: the engine reads nvngx_dlssnr.dll's file version for the panel's
+REM model line (DllVersion).
 cl /nologo /EHsc /O2 /utf-8 /W3 /D_WIN32_WINNT=0x0601 ^
    /Fo"%BUILD%\\" /I "%ROOT%\deps\sdk_include" ^
    "%ROOT%\src\dlssnr_dshow.cpp" "%ROOT%\src\dlssnr_engine.cpp" ^
    /LD /Fe:"%OUT%\dlssnr_dshow.dll" ^
    /link /DEF:"%ROOT%\src\dlssnr_dshow.def" ^
    strmiids.lib ole32.lib oleaut32.lib user32.lib advapi32.lib ^
-   gdi32.lib comctl32.lib shell32.lib uuid.lib d3d12.lib dxgi.lib ^
+   gdi32.lib comctl32.lib shell32.lib uuid.lib d3d12.lib dxgi.lib version.lib ^
    "%ROOT%\deps\sdk_lib\nvsdk_ngx_s.lib"
 if errorlevel 1 ( echo [FAILED] & pause & exit /b 1 )
 

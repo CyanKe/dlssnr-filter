@@ -308,9 +308,14 @@ int main(int argc, char** argv) {
     outY.assign((size_t)W * H, 0);
     outUV.assign((size_t)W * H / 2, 0);
 
+    // One layer on purpose: this tool measures the resolution curve, and the
+    // chain is the other axis (see tools\engine_selftest.cpp for that one).
     dlssnr::Options o;
-    o.style = 1; o.intensity = 1.0f; o.localTone = 1.0f; o.localStruct = 1.0f;
-    o.skinStruct = 0.0f; o.autoMask = 0;
+    o.layerCount = 1;
+    o.layers[0].style = 1;
+    o.layers[0].intensity = 1.0f; o.layers[0].localTone = 1.0f;
+    o.layers[0].localStruct = 1.0f;
+    o.layers[0].skinStruct = 0.0f; o.layers[0].autoMask = 0;
     dlssnr::SetOptions(o);
 
     printf("video %dx%d (%.1f MPix), warm-up %.0f s per configuration, appDir=%s\n\n",
@@ -355,7 +360,7 @@ int main(int argc, char** argv) {
     int nres = 0;
     for (int ci = 0; ci < kCfgCount; ++ci) {
         const Cfg& c = cfgs[ci];
-        o.localTone = c.tone; o.localStruct = c.strct;
+        o.layers[0].localTone = c.tone; o.layers[0].localStruct = c.strct;
         dlssnr::SetOptions(o);
 
         Result r;

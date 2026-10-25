@@ -38,6 +38,7 @@
 #include <string.h>
 #include <string>
 #include "dlssnr_engine.h"          // the built-in GPU engine
+#include "dlssnr_models.h"          // which network a preset selects (the panel's)
 #if defined(_M_X64) || defined(_M_IX86)
 #include <intrin.h>      // __cpuid
 #include <tmmintrin.h>   // SSSE3 pshufb, for the vectorised colour conversion
@@ -125,7 +126,10 @@ static void LogRaw(const char* fmt, ...) {
 // name with an older build would mean either side mapping a view smaller than
 // the struct it dereferences -- i.e. an access violation inside the player --
 // so a new field block gets a new name instead of a version check.
-static const wchar_t* kSharedName = L"Local\\DLSSNR_DShow_Shared_v2";
+// The trailing version is part of the LAYOUT, not of the product: a reader that
+// was built against the 380-byte v2 struct must never attach to the 396-byte v4
+// one and read the last fields as garbage, so a layout change renames the block.
+static const wchar_t* kSharedName = L"Local\\DLSSNR_DShow_Shared_v4";
 static const unsigned int kSharedMagic = 0x4E534C44;   // 'DLSN'
 
 #pragma pack(push, 1)
@@ -171,6 +175,24 @@ struct SharedState {
     volatile int   dropEnabled;    // the switch, as currently in effect
     volatile float dropPct;        // framesDropped / framesSeen, 0..100
     volatile float dropLagMs;      // lateness measured at the last decision
+
+    // ---- layers ----
+    // Also appended at the end, for the same reason. Per-layer PARAMETERS are
+    // deliberately not published here: the control panel lives in this process
+    // and drives Engine::SetOptions() directly, so shipping the whole chain
+    // through the shared block would create a second source of truth for it.
+    // What an outside reader does need is how many passes are actually running,
+    // because that is what the per-frame cost is proportional to.
+    volatile int layersActive;     // NGX features the engine has live right now
+    volatile int layersRequested;  // layers the chain is configured for
+
+    // ---- which network the frame goes through ----
+    // Appended at the end, for the same reason as everything above. The panel
+    // and the ini own the REQUEST; `applied` is what the engine actually created
+    // its features with, and the two differ when the DLL refused the request and
+    // the engine fell back to its own default (dlssnr::ModelFellBack()).
+    volatile int modelRequested;   // DLSSNR.Hint.Render.Preset asked for
+    volatile int modelApplied;     // the one the live features were made with
 };
 #pragma pack(pop)
 
@@ -178,12 +200,16 @@ struct SharedState {
 // silent layout change would make it print another field's value. Pin the
 // offsets: adding a field means touching the mapping name above, this list and
 // the constants in that script, all on purpose.
-static_assert(sizeof(SharedState) == 380,                "update tools\\read_telemetry.py");
+static_assert(sizeof(SharedState) == 396,                "update tools\\read_telemetry.py");
 static_assert(offsetof(SharedState, status)       == 80, "update tools\\read_telemetry.py");
 static_assert(offsetof(SharedState, framesDropped) == 364, "update tools\\read_telemetry.py");
 static_assert(offsetof(SharedState, dropEnabled)   == 368, "update tools\\read_telemetry.py");
 static_assert(offsetof(SharedState, dropPct)       == 372, "update tools\\read_telemetry.py");
 static_assert(offsetof(SharedState, dropLagMs)     == 376, "update tools\\read_telemetry.py");
+static_assert(offsetof(SharedState, layersActive)    == 380, "update tools\\read_telemetry.py");
+static_assert(offsetof(SharedState, layersRequested) == 384, "update tools\\read_telemetry.py");
+static_assert(offsetof(SharedState, modelRequested)  == 388, "update tools\\read_telemetry.py");
+static_assert(offsetof(SharedState, modelApplied)    == 392, "update tools\\read_telemetry.py");
 
 // pass-through reason codes (mirrored by the panel)
 enum {
@@ -218,7 +244,7 @@ static void OpenShared() {
     if (g_shared->magic != kSharedMagic) {
         ZeroMemory((void*)g_shared, sizeof(SharedState));
         g_shared->magic = kSharedMagic;
-        g_shared->version = 2;
+        g_shared->version = 4;      // 4 = the model presets at the end
         g_shared->structSize = (unsigned int)sizeof(SharedState);
         // sensible defaults for the requested block
         g_shared->reqEnabled = 1;
@@ -426,6 +452,13 @@ static void InitModuleDir(HMODULE h) {
     GetModuleFileNameW(h, g_dir, _countof(g_dir));
     wchar_t* slash = wcsrchr(g_dir, L'\\');
     if (slash) *slash = 0;
+    // Tell the engine where nvngx_dlssnr.dll lives before anything is initialised,
+    // so the panel's model row can ask "which networks does this DLL carry?" the
+    // moment it opens -- a property page or a tray menu can be used before a
+    // single frame has been played, and without this the scan would find nothing
+    // and grey out choices that are perfectly available. This only copies a path
+    // (no LoadLibrary), which is what makes it safe under the loader lock.
+    dlssnr::SetModuleDir(g_dir);
     InitializeCriticalSection(&g_logLock);
     g_logLockInit = true;
     InitializeCriticalSection(&g_refreshLock);   // refresh sink registry
@@ -439,13 +472,16 @@ static void InitModuleDir(HMODULE h) {
 // ---------------------------------------------------------------------------
 struct Config {
     bool  enabled;
-    int   style;
-    float intensity;     // 0..1
-    float localTone;     // 0..1
-    float localStruct;   // 0..1
-    float skinStruct;    // 0..2, 0 = off (same range/default as Magpie's
-                         //   DLSSNR "Skin Structure Strength")
-    bool  autoMask;      // DLSSNR.UseAutoMask
+    // The chain, in the panel's own units. Each layer is a full DLSSNR pass
+    // with its OWN NGX feature and therefore its own temporal history -- see
+    // src\dlssnr_layers.h for why sharing one feature between passes is not an
+    // option, and src\dlssnr_engine.cpp for where the chain is recorded.
+    //
+    // Layer 1 keeps the historical unprefixed ini keys (style, intensity, ...),
+    // so every existing dlssnr_dshow.ini still describes exactly the picture it
+    // used to; layers 2..8 are layer<N>_style and so on.
+    dlssnr::LayerCfg layers[dlssnr::kMaxLayers];
+    int   layerCount;    // how many of them the chain actually runs (1..8)
     // Late-frame policy. At 4K60 the engine needs 34 ms for a 16.7 ms budget,
     // so "process every frame" cannot work: the video branch advances at ~29 fps
     // while the audio follows the reference clock, and the difference ACCUMULATES
@@ -461,20 +497,54 @@ struct Config {
     // it is off by default and lives behind its own switch. procScale is the
     // slider position and is remembered while the switch is off.
     bool  procEnabled;   // "procenable"
+    // Extrapolation gain in percent: 100 = off. NOT a layer count -- see the
+    // long note in dlssnr_engine.h. Session-level, like procEnabled.
+    int   extrapPct;     // "extrap"
     int   procScale;     // "procscale": 25..100, percent of the video size
+    // Which network inside nvngx_dlssnr.dll to run ("model", 0 = the DLL's own
+    // default). Session-level exactly like procScale -- DLSSNR.Hint.Render.Preset
+    // is a feature-CREATION parameter, so a different value means different
+    // features -- and clamped by dlssnr::ModelClamp(). src\dlssnr_models.h owns
+    // what the values mean; the panel owns the labels.
+    int   model;         // "model"
 };
+
+// One layer's parameters out of the ini. Layer 1 reads the historical
+// unprefixed keys, every other layer is "layer<N>_<key>" -- that rule lives in
+// dlssnr::LayerKeyName so this reader and the panel's writer cannot drift apart.
+// Defaults come from LayerDefault(), i.e. a missing key means the documented
+// default rather than a zero that would silently change the picture.
+static dlssnr::LayerCfg ReadLayerFromIni(int layer1, const wchar_t* ini) {
+    dlssnr::LayerCfg l = dlssnr::LayerDefault();
+    wchar_t k[64];
+    dlssnr::LayerKeyName(layer1, L"style",         k, _countof(k));
+    l.style        = GetPrivateProfileIntW(L"DLSSNR", k, l.style, ini);
+    dlssnr::LayerKeyName(layer1, L"intensity",     k, _countof(k));
+    l.pctIntensity = GetPrivateProfileIntW(L"DLSSNR", k, l.pctIntensity, ini);
+    dlssnr::LayerKeyName(layer1, L"localtone",     k, _countof(k));
+    l.pctTone      = GetPrivateProfileIntW(L"DLSSNR", k, l.pctTone, ini);
+    dlssnr::LayerKeyName(layer1, L"localstruct",   k, _countof(k));
+    l.pctStruct    = GetPrivateProfileIntW(L"DLSSNR", k, l.pctStruct, ini);
+    dlssnr::LayerKeyName(layer1, L"skinstructure", k, _countof(k));
+    l.pctSkin      = GetPrivateProfileIntW(L"DLSSNR", k, l.pctSkin, ini);
+    dlssnr::LayerKeyName(layer1, L"automask",      k, _countof(k));
+    l.autoMask     = GetPrivateProfileIntW(L"DLSSNR", k, l.autoMask, ini);
+    // 100% = 1.0 is the "full strength" default everywhere. The RANGES are per
+    // parameter because they were measured rather than assumed: DLSSNR.Intensity
+    // saturates at 1.0 (1.0 and 2.0 gave bit-identical frames) so it stops at
+    // 100%, while local tone / local structure keep responding at 2.0 and run to
+    // 200%. LayerClamp() is the one place that knows all of that.
+    return dlssnr::LayerClamp(l);
+}
 
 static Config ReadConfig() {
     Config c;
     c.enabled     = true;
-    c.style       = 0;
-    c.intensity   = 1.0f;
-    c.localTone   = 1.0f;
-    c.localStruct = 1.0f;
-    c.skinStruct  = 0.0f;
-    c.autoMask    = false;
+    c.layerCount  = 1;
+    for (int i = 0; i < dlssnr::kMaxLayers; ++i) c.layers[i] = dlssnr::LayerDefault();
     c.dropFrames  = true;      // on by default: without it an overloaded engine
     c.maxLagMs    = 0;         // drifts out of sync instead of dropping frames
+    c.extrapPct   = 100;       // extrapolation is opt-in, and 100 IS off
     c.procEnabled = false;     // reduced resolution is opt-in: it trades picture
     c.procScale   = 50;        // quality for frame rate, and 50% is the point that
                                // makes 4K60 fit (See ENGINEERING_NOTES 8)
@@ -484,28 +554,39 @@ static Config ReadConfig() {
     if (GetFileAttributesW(ini) == INVALID_FILE_ATTRIBUTES) return c;
 
     c.enabled     = GetPrivateProfileIntW(L"DLSSNR", L"enabled",     1, ini) != 0;
-    c.style       = GetPrivateProfileIntW(L"DLSSNR", L"style",       0, ini);
-    int iInt      = GetPrivateProfileIntW(L"DLSSNR", L"intensity", 100, ini);
-    int iTone     = GetPrivateProfileIntW(L"DLSSNR", L"localtone",  100, ini);
-    int iStruct   = GetPrivateProfileIntW(L"DLSSNR", L"localstruct",100, ini);
-    int iSkin     = GetPrivateProfileIntW(L"DLSSNR", L"skinstructure", 0, ini);
-    // 100% = 1.0 is the "full strength" default everywhere, so old ini files keep
-    // their meaning. Only the parameters that were measured to keep responding
-    // above 1.0 accept up to 200% = 2.0: DLSSNR.Intensity saturates at 1.0
-    // (1.0 and 2.0 gave bit-identical frames), so it is capped at 100%.
-    c.intensity   = (float)(iInt    < 0 ? 0 : (iInt    > 100 ? 100 : iInt))    / 100.0f;
-    c.localTone   = (float)(iTone   < 0 ? 0 : (iTone   > 200 ? 200 : iTone))   / 100.0f;
-    c.localStruct = (float)(iStruct < 0 ? 0 : (iStruct > 200 ? 200 : iStruct)) / 100.0f;
-    c.skinStruct  = (float)(iSkin   < 0 ? 0 : (iSkin   > 200 ? 200 : iSkin))   / 100.0f;
-    c.autoMask    = GetPrivateProfileIntW(L"DLSSNR", L"automask", 0, ini) != 0;
+    // Read the COUNT first: it is what decides how many layer tabs the panel
+    // shows, and out-of-range values are clamped rather than believed. A missing
+    // "layers" key means 1, which is exactly what every pre-layers ini file
+    // describes, so those files keep working unchanged.
+    c.layerCount  = dlssnr::LayerClampCount(
+                        GetPrivateProfileIntW(L"DLSSNR", L"layers", 1, ini));
+    // Every layer is read, not just the first c.layerCount of them: the extra
+    // ones cost 6 profile reads and mean that raising the layer count in the
+    // panel picks up the settings already stored for that layer instead of
+    // silently starting from the defaults.
+    for (int i = 0; i < dlssnr::kMaxLayers; ++i)
+        c.layers[i] = ReadLayerFromIni(i + 1, ini);
     c.dropFrames  = GetPrivateProfileIntW(L"DLSSNR", L"dropframes", 1, ini) != 0;
     int iLag      = GetPrivateProfileIntW(L"DLSSNR", L"maxlagms", 0, ini);
     // 0 = auto (= one frame interval). The cap keeps a hand-edited ini from
     // telling the policy to accept a multi-second offset.
     c.maxLagMs    = iLag < 0 ? 0 : (iLag > 500 ? 500 : iLag);
     c.procEnabled = GetPrivateProfileIntW(L"DLSSNR", L"procenable", 0, ini) != 0;
+    {
+        int iEx = GetPrivateProfileIntW(L"DLSSNR", L"extrap", 100, ini);
+        // Below 100 the gain would UNDO the network's correction, which is not
+        // what the control says it does. The engine clamps too; this keeps the
+        // ini and the slider in agreement.
+        if (iEx < 100) iEx = 100;
+        if (iEx > 400) iEx = 400;
+        c.extrapPct = iEx;
+    }
     int iProc     = GetPrivateProfileIntW(L"DLSSNR", L"procscale", 50, ini);
     c.procScale   = iProc < 25 ? 25 : (iProc > 100 ? 100 : iProc);
+    // Missing "model" means 0 = the DLL's own default, which is what every ini
+    // written before this key existed describes (and on 310.9.16 that default is
+    // the new lighter network, so an old ini keeps the picture it had).
+    c.model       = dlssnr::ModelClamp(GetPrivateProfileIntW(L"DLSSNR", L"model", 0, ini));
     return c;
 }
 
@@ -524,14 +605,11 @@ static float Clamp01(float v) {
     return v;
 }
 
-// Same guard for the parameter whose range is not 0..1 (skin structure is
-// 0..2, matching Magpie's DLSSNR default of 0 = off).
-static float ClampRange(float v, float lo, float hi, float fallback) {
-    if (!(v == v)) return fallback;
-    if (v < lo) return lo;
-    if (v > hi) return hi;
-    return v;
-}
+// There used to be a ClampRange() here for skin structure (0..2, matching
+// Magpie's DLSSNR default of 0 = off). Layer ranges now live in exactly one
+// place -- dlssnr::LayerClamp() in src\dlssnr_layers.h -- because with eight
+// independently editable layers, two homes for "what is a legal value" is one
+// too many.
 
 // One frame period, in 100 ns REFERENCE_TIME ticks. Used by the late-frame
 // policy as the yardstick for "this frame has slipped a whole frame behind".
@@ -590,6 +668,10 @@ public:
     Engine() : m_ready(false), m_failed(false),
                m_w(0), m_h(0), m_thread(nullptr),
                m_evtWake(nullptr), m_quit(false) {
+        // A valid chain before the first filter instance seeds us from the ini:
+        // one layer, the documented defaults. Nothing should read these before
+        // SeedOptionsOnce() runs, but "nothing should" is not a guarantee.
+        for (int i = 0; i < dlssnr::kMaxLayers; ++i) m_layers[i] = dlssnr::LayerDefault();
         InitializeCriticalSection(&m_lock);
         m_evtWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         // The worker lives for the whole process, so RequestInit() never has to
@@ -646,6 +728,7 @@ public:
         InterlockedExchange(&m_wantW, (LONG)w);
         InterlockedExchange(&m_wantH, (LONG)h);
         InterlockedExchange(&m_wantScale, (LONG)ProcScalePct());
+        InterlockedExchange(&m_wantModel, (LONG)ModelPct());
         if (m_evtWake) SetEvent(m_evtWake);
     }
 
@@ -681,6 +764,7 @@ public:
     // (effective: 100 while the switch is off), Applied* is what it ended up
     // with, which can differ when the reduced size is not usable.
     bool  OptProcEnabled() { return m_optProcEnabled; }
+    int   OptExtrap()      { return m_extrapPct; }           // 100 = off
     int   OptProcScale()   { return m_optProcScale; }        // slider position
     int   ProcScalePct()   { return m_optProcEnabled ? m_optProcScale : 100; }
     int   Scale()          { return m_scale; }               // session was built for
@@ -700,61 +784,172 @@ public:
         RequestInit((int)m_w, (int)m_h);
     }
 
+    // Extrapolation gain. Deliberately NOT like SetProcScale above: the gain is
+    // read per frame in the two colour-conversion shaders, so nothing is rebuilt
+    // and the picture changes on the next frame. 100 = off, and off is
+    // bit-identical to the build before this feature existed.
+    void SetExtrap(int pct) {
+        if (pct < 100) pct = 100;
+        if (pct > 400) pct = 400;
+        m_extrapPct = pct;
+        PushOptions(true);
+    }
+
+    // ---- which network inside nvngx_dlssnr.dll to run ----------------------
+    // Same shape as the reduced-resolution switch above, and for the same reason:
+    // DLSSNR.Hint.Render.Preset is a feature-CREATION parameter, so a different
+    // value means different features and the session has to be rebuilt. The
+    // rebuild runs on the worker (RequestInit), which is what keeps a switch from
+    // blocking the player's streaming thread for the length of a model load.
+    //
+    // ModelPct() is what the session should be built for; Model() is what it WAS
+    // built for, and AppliedModel() is what the engine ended up using -- the two
+    // differ only when the DLL refused the preset and the engine fell back.
+    int   OptModel()     { return m_optModel; }
+    int   ModelPct()     { return m_optModel; }
+    int   Model()        { return m_model; }
+    int   AppliedModel() { return m_appliedModel; }
+    bool  ModelFellBack(){ return m_modelFellBack; }
+
+    void SetModel(int preset) {
+        preset = dlssnr::ModelClamp(preset);
+        if (preset == m_optModel) return;          // nothing to rebuild
+        m_optModel = preset;
+        RequestInit((int)m_w, (int)m_h);
+    }
+
     // The ini is only the STARTING point. Because this engine lives for the
     // whole process, re-reading the ini on every new filter instance would
     // revert a change the user just made in the control panel, so seed once.
-    void SeedOptionsOnce(bool enabled, int style, float intensity, float tone,
-                         float strct, float skin, bool autoMask,
-                         bool dropFrames, int maxLagMs,
-                         bool procEnabled, int procScale) {
+    //
+    // The layer array lives HERE, not in the per-instance Config, for the same
+    // reason: a player builds one filter instance per file, and "2 layers, the
+    // second one softer" is a setting the user expects to survive opening the
+    // next file in the same session.
+    void SeedOptionsOnce(const Config& c) {
         EnterCriticalSection(&m_lock);
         bool first = !m_seeded;
         m_seeded = true;
         LeaveCriticalSection(&m_lock);
         if (!first) return;
-        SetOptions(enabled, style, intensity, tone, strct, skin, autoMask);
-        m_optDropFrames  = dropFrames;
-        m_optMaxLagMs    = maxLagMs;
-        m_optProcEnabled = procEnabled;
-        if (procScale >= 25 && procScale <= 100) m_optProcScale = procScale;
+        m_layerCount = dlssnr::LayerClampCount(c.layerCount);
+        for (int i = 0; i < dlssnr::kMaxLayers; ++i)
+            m_layers[i] = dlssnr::LayerClamp(c.layers[i]);
+        m_selLayer = 0;
+        m_optEnabled     = c.enabled;
+        m_optDropFrames  = c.dropFrames;
+        m_optMaxLagMs    = c.maxLagMs;
+        m_optProcEnabled = c.procEnabled;
+        if (c.procScale >= 25 && c.procScale <= 100) m_optProcScale = c.procScale;
+        m_extrapPct = (c.extrapPct < 100) ? 100 : (c.extrapPct > 400 ? 400 : c.extrapPct);
+        m_optModel = dlssnr::ModelClamp(c.model);
+        PushOptions(true);
     }
-    dlssnr::Options Opts() const {
-        dlssnr::Options o;
-        o.style = m_optStyle;
-        o.intensity = m_optIntensity;
-        o.localTone = m_optTone;
-        o.localStruct = m_optStrct;
-        o.skinStruct = m_optSkin;
-        o.autoMask = m_optAutoMask ? 1 : 0;
-        o.uiCorrection = 0;
-        return o;
-    }
-    int   OptStyle()     { return m_optStyle; }
-    float OptIntensity() { return m_optIntensity; }
-    float OptTone()      { return m_optTone; }
-    float OptStruct()    { return m_optStrct; }
-    float OptSkin()      { return m_optSkin; }
-    bool  OptAutoMask()  { return m_optAutoMask; }
 
-    // Apply engine options. Safe to call when not initialised yet: the values
-    // are cached in m_cfg and pushed again by DoInit(), so a panel change made
-    // before the model loads still takes effect.
+    // ---- the chain, as the panel and the tray see it ---------------------
+    // The UI edits ONE layer at a time (the "current" layer); these accessors
+    // are how it asks which one that is and what is in it.
+    int OptLayerCount() { return m_layerCount; }
+    int OptSelLayer()   { return m_selLayer; }
+    dlssnr::LayerCfg OptLayer(int i) {
+        if (i < 0) i = 0;
+        if (i >= dlssnr::kMaxLayers) i = dlssnr::kMaxLayers - 1;
+        return m_layers[i];
+    }
+    dlssnr::LayerCfg OptSel() { return OptLayer(m_selLayer); }
+
+    void SetSelLayer(int i) {
+        const int n = dlssnr::LayerClampCount(m_layerCount);
+        if (i < 0) i = 0;
+        if (i > n - 1) i = n - 1;
+        m_selLayer = i;
+    }
+
+    // Grow or shrink the chain.
+    //
+    // Growing COPIES the current last layer into every new slot: the common
+    // intent of "give me one more pass" is "do that again, a bit softer", not
+    // "start from the defaults and lose the look I just dialled in". Shrinking
+    // keeps every layer's settings, so 3 -> 2 -> 3 does not lose layer 3.
+    //
+    // Either way this only records the new count: the extra NGX features are
+    // created lazily on the next frame (dlssnr::SetOptions documents why
+    // creation cannot happen here -- it needs the queue and a command list, and
+    // this runs on the panel's thread).
+    void SetLayerCount(int n) {
+        n = dlssnr::LayerClampCount(n);
+        if (n == m_layerCount) return;
+        if (n > m_layerCount) {
+            const dlssnr::LayerCfg last = m_layers[m_layerCount - 1];
+            for (int i = m_layerCount; i < n; ++i) m_layers[i] = last;
+        }
+        m_layerCount = n;
+        if (m_selLayer > n - 1) m_selLayer = n - 1;
+        PushOptions(true);
+    }
+
+    // Live edit of one layer. Reaches the network on the next frame.
+    void SetLayer(int i, const dlssnr::LayerCfg& l) {
+        if (i < 0 || i >= dlssnr::kMaxLayers) return;
+        m_layers[i] = dlssnr::LayerClamp(l);
+        PushOptions(true);
+    }
+    void SetSel(const dlssnr::LayerCfg& l) { SetLayer(m_selLayer, l); }
+
+    // ---- selected-layer shims -------------------------------------------
+    // The panel and the tray edit one layer at a time, and these are what they
+    // use to read it, so "intensity" keeps meaning "the intensity the user is
+    // looking at" without every call site having to learn about layers. Floats
+    // in the engine's own units (1.0 == 100%).
+    int   OptStyle()     { return OptSel().style; }
+    float OptIntensity() { return OptSel().pctIntensity / 100.0f; }
+    float OptTone()      { return OptSel().pctTone / 100.0f; }
+    float OptStruct()    { return OptSel().pctStruct / 100.0f; }
+    float OptSkin()      { return OptSel().pctSkin / 100.0f; }
+    bool  OptAutoMask()  { return OptSel().autoMask != 0; }
+
+    // Apply a parameter edit to the layer currently being edited. The signature
+    // is kept from the single-layer days so every existing call site (the
+    // panel's DlssNrApply, the tray's preset menus) keeps working; the values
+    // arrive in the panel's units and are converted exactly once, here.
+    // Safe before the engine is ready: the values are cached and re-pushed by
+    // DoInit(), so an edit made while the model loads still takes effect.
     void SetOptions(bool enabled, int style, float intensity, float tone,
                     float strct, float skin, bool autoMask) {
-        m_optEnabled = enabled; m_optStyle = style; m_optIntensity = intensity;
-        m_optTone = tone; m_optStrct = strct;
+        dlssnr::LayerCfg l = m_layers[m_selLayer];
+        l.style        = style;
+        l.pctIntensity = (int)(intensity * 100.0f + 0.5f);
+        l.pctTone      = (int)(tone * 100.0f + 0.5f);
+        l.pctStruct    = (int)(strct * 100.0f + 0.5f);
+        l.pctSkin      = (int)(skin * 100.0f + 0.5f);
+        l.autoMask     = autoMask ? 1 : 0;
         // Defensive: a stale ini or a hand-edited config must not push an
-        // out-of-range value into the NGX parameter block.
-        m_optSkin = ClampRange(skin, 0.0f, 2.0f, 0.0f);
-        m_optAutoMask = autoMask;
-        InterlockedIncrement(&m_paramRev);
-        m_optDirty = true;
-        if (m_ready) {
-            EnterCriticalSection(&m_lock);
-            dlssnr::SetOptions(Opts());
-            LeaveCriticalSection(&m_lock);
-            m_optDirty = false;
+        // out-of-range value into the NGX parameter block. LayerClamp() owns
+        // the ranges (see dlssnr_layers.h).
+        m_layers[m_selLayer] = dlssnr::LayerClamp(l);
+        m_optEnabled = enabled;
+        PushOptions(true);
+    }
+
+    // The whole chain, in the engine's units.
+    dlssnr::Options Opts() const {
+        dlssnr::Options o;
+        const int n = dlssnr::LayerClampCount(m_layerCount);
+        o.layerCount = n;
+        for (int i = 0; i < n; ++i) {
+            const dlssnr::LayerCfg& l = m_layers[i];
+            dlssnr::LayerOptions& d = o.layers[i];
+            d.style        = l.style;
+            d.intensity    = l.pctIntensity / 100.0f;
+            d.localTone    = l.pctTone / 100.0f;
+            d.localStruct  = l.pctStruct / 100.0f;
+            d.skinStruct   = l.pctSkin / 100.0f;
+            d.autoMask     = l.autoMask ? 1 : 0;
+            d.uiCorrection = 0;
         }
+        // Global, not per layer: one extrapolation over the whole chain.
+        o.extrapPct = m_extrapPct;
+        return o;
     }
 
     // Returns true and fills dst, or false to tell the caller to pass through.
@@ -787,6 +982,22 @@ public:
     }
 
 private:
+    // Publish the current settings to the engine, and remember that an edit
+    // happened before the model finished loading so DoInit() re-applies it
+    // instead of letting the ini snapshot overwrite it.
+    // Called from the panel's thread and the filter's streaming thread, so it
+    // takes m_lock: dlssnr::SetOptions() writes the shared parameter block that
+    // ProcessNv12 reads.
+    void PushOptions(bool markDirty) {
+        InterlockedIncrement(&m_paramRev);
+        if (markDirty) m_optDirty = true;
+        if (!m_ready) return;
+        EnterCriticalSection(&m_lock);
+        dlssnr::SetOptions(Opts());
+        LeaveCriticalSection(&m_lock);
+        m_optDirty = false;
+    }
+
     static DWORD WINAPI ThreadProc(LPVOID self) { ((Engine*)self)->Run(); return 0; }
 
     // Pin this DLL for the rest of the process before creating the singleton.
@@ -804,12 +1015,17 @@ private:
     void Run() {
         for (;;) {
             if (m_quit) return;
-            int w, h, scale;
+            int w, h, scale, model;
             EnterCriticalSection(&m_lock);
             if (InterlockedExchange(&m_sessionReset, 0)) ApplySessionReset();
             w = (int)m_wantW; h = (int)m_wantH; scale = (int)m_wantScale;
+            model = (int)m_wantModel;
+            // The model is part of the session identity exactly like the geometry
+            // and the scale: it is a feature-creation parameter, so a session
+            // built for another network cannot be reused.
             bool needInit = (w > 0 && h > 0) &&
-                            !(m_ready && m_w == w && m_h == h && m_scale == scale);
+                            !(m_ready && m_w == w && m_h == h && m_scale == scale &&
+                              m_model == model);
             LeaveCriticalSection(&m_lock);
 
             if (needInit) {
@@ -860,15 +1076,17 @@ private:
         // model was still loading, that choice must survive the init rather than
         // being overwritten by the INI values read at construction time.
         if (!m_optDirty) {
-            m_optStyle = cfg.style; m_optIntensity = cfg.intensity;
-            m_optTone = cfg.localTone; m_optStrct = cfg.localStruct;
-            m_optSkin = cfg.skinStruct; m_optAutoMask = cfg.autoMask;
+            m_layerCount = dlssnr::LayerClampCount(cfg.layerCount);
+            for (int i = 0; i < dlssnr::kMaxLayers; ++i)
+                m_layers[i] = dlssnr::LayerClamp(cfg.layers[i]);
+            if (m_selLayer > m_layerCount - 1) m_selLayer = m_layerCount - 1;
             m_optEnabled = cfg.enabled;
         }
         dlssnr::SetOptions(Opts());
         m_optDirty = false;
         const int wantScale = (int)m_wantScale;
-        const bool ok = dlssnr::Init(w, h, g_dir, log, wantScale);
+        const int wantModel = (int)m_wantModel;
+        const bool ok = dlssnr::Init(w, h, g_dir, log, wantScale, wantModel);
         if (ok) {
             m_w = dlssnr::Width();
             m_h = dlssnr::Height();
@@ -877,6 +1095,13 @@ private:
             // the applied value here would make the worker re-init for ever.
             m_scale        = wantScale;
             m_appliedScale = dlssnr::ProcScalePercent();
+            // The model splits the same way: `m_model` is the request (so the
+            // worker's comparison settles), `m_appliedModel` is what the features
+            // were actually created with -- the DLL can refuse a preset, and then
+            // the panel has to show the truth rather than the request.
+            m_model         = wantModel;
+            m_appliedModel  = dlssnr::ModelPreset();
+            m_modelFellBack = dlssnr::ModelFellBack();
             m_ready = true;
             m_failed = false;
         }
@@ -887,9 +1112,11 @@ private:
                    w, h, wantScale);
             return;   // keep thread alive; a later type change may succeed
         }
-        LogRaw("engine: READY %dx%d, network %dx%d (%d%% asked, %d%% applied)",
+        LogRaw("engine: READY %dx%d, network %dx%d (%d%% asked, %d%% applied), "
+               "model preset %d requested / %d applied%s",
                m_w, m_h, dlssnr::ProcWidth(), dlssnr::ProcHeight(),
-               wantScale, m_appliedScale);
+               wantScale, m_appliedScale, wantModel, m_appliedModel,
+               m_modelFellBack ? " (DLL REFUSED the request -> its default)" : "");
         // The UI is the tray icon, which owns its own thread and opens the
         // native control panel; nothing to launch from here (and no Python).
     }
@@ -907,6 +1134,14 @@ private:
     // from the applied value so a fallback to native does not look like a
     // mismatch that needs re-initialising.
     volatile LONG m_wantScale = 100;
+    // Which network the session should be built for, and the two values that
+    // describe what happened: `m_model` is the request the current session was
+    // built for (so the worker's comparison settles), `m_appliedModel` is what
+    // the features were created with. See SetModel().
+    volatile LONG m_wantModel = 0;
+    int           m_model = -1;          // -1 = no session yet, so the first wins
+    int           m_appliedModel = 0;
+    bool          m_modelFellBack = false;
     HANDLE       m_evtWake;
     volatile bool m_quit;
     CRITICAL_SECTION m_lock;
@@ -920,14 +1155,20 @@ private:
     // engine options (kept here so a panel change before init still applies)
     bool  m_optEnabled = true;
     bool  m_seeded     = false;
-    int   m_optStyle = 0;
-    float m_optIntensity = 1.0f, m_optTone = 1.0f, m_optStrct = 1.0f;
-    float m_optSkin = 0.0f;              // 0..2 (0 = off)
-    bool  m_optAutoMask = false;
+    // The chain. m_layers[0..m_layerCount-1] are the layers in use; the rest are
+    // kept so shrinking and re-growing the chain does not lose settings.
+    // WRITTEN under m_lock (SetLayer / SetLayerCount) but READ without it by the
+    // panel's refresh path: plain ints cannot tear, and the worst case is one
+    // refresh that shows a mix of the old and the new values.
+    dlssnr::LayerCfg m_layers[dlssnr::kMaxLayers];
+    int   m_layerCount = 1;
+    int   m_selLayer   = 0;              // 0-based: the layer the UI edits
     bool  m_optDropFrames = true;        // late-frame policy switch
     int   m_optMaxLagMs   = 0;           // 0 = auto (one frame interval)
     bool  m_optProcEnabled = false;      // reduced-resolution switch
+    int   m_extrapPct = 100;             // extrapolation gain, 100 = off
     int   m_optProcScale   = 50;         // its slider, 25..100 (% of the video)
+    int   m_optModel       = 0;          // which network to build for (0 = default)
     volatile bool m_optDirty = false;
     volatile double m_lastProcessMs = 0.0;
     volatile LONG m_paramRev = 0;
@@ -1951,19 +2192,24 @@ public:
         // The engine is process-wide, so it is seeded from the ini exactly once
         // and afterwards its live options are authoritative -- that is what lets
         // the control panel toggle the master switch mid-playback.
-        m_engine.SeedOptionsOnce(m_cfg.enabled, m_cfg.style, m_cfg.intensity,
-                                 m_cfg.localTone, m_cfg.localStruct,
-                                 m_cfg.skinStruct, m_cfg.autoMask,
-                                 m_cfg.dropFrames, m_cfg.maxLagMs,
-                                 m_cfg.procEnabled, m_cfg.procScale);
+        m_engine.SeedOptionsOnce(m_cfg);
         if (g_shared) m_lastSeq = g_shared->reqSeq;
-        LogRaw("filter: created; config enabled=%d style=%d intensity=%d%% "
-               "skinstructure=%d%% automask=%d dropframes=%d maxlagms=%d "
-               "procscale=%d%% (enabled=%d)",
-               m_cfg.enabled ? 1 : 0, m_cfg.style, (int)(m_cfg.intensity * 100),
-               (int)(m_cfg.skinStruct * 100), m_cfg.autoMask ? 1 : 0,
+        LogRaw("filter: created; config enabled=%d layers=%d dropframes=%d "
+               "maxlagms=%d procscale=%d%% (enabled=%d)",
+               m_cfg.enabled ? 1 : 0, m_engine.OptLayerCount(),
                m_engine.OptDropFrames() ? 1 : 0, m_engine.OptMaxLagMs(),
                m_engine.OptProcScale(), m_engine.OptProcEnabled() ? 1 : 0);
+        // One line per layer. The cost of a chain is the sum of its passes, so
+        // "what was the chain actually set to" is the first question a log has
+        // to be able to answer -- and it must come from the engine's live state,
+        // not from the ini, which the panel overwrites.
+        for (int i = 0; i < m_engine.OptLayerCount(); ++i) {
+            const dlssnr::LayerCfg l = m_engine.OptLayer(i);
+            LogRaw("filter:   layer %d/%d style=%d intensity=%d%% tone=%d%% "
+                   "struct=%d%% skin=%d%% automask=%d",
+                   i + 1, m_engine.OptLayerCount(), l.style, l.pctIntensity,
+                   l.pctTone, l.pctStruct, l.pctSkin, l.autoMask);
+        }
     }
     virtual ~CDlssNrFilter() {
         // Unregister first: the panel thread walks this list, so it must not see
@@ -2000,25 +2246,25 @@ public:
         long seq = s->reqSeq;
         if (seq == m_lastSeq) return;
         m_lastSeq = seq;
-        m_cfg.enabled     = s->reqEnabled != 0;
-        m_cfg.style       = s->reqStyle;
-        m_cfg.intensity   = Clamp01(s->reqIntensity);
-        m_cfg.localTone   = Clamp01(s->reqLocalTone);
-        m_cfg.localStruct = Clamp01(s->reqLocalStruct);
-        // skinStruct / autoMask have no legacy request field: the request path
-        // predates them and the in-process panel drives Engine::SetOptions()
-        // directly, so keep the ini/current values here.
-        // Push to the engine now (no-op if it is not ready; DoInit() re-applies
-        // the cached values when the model finishes loading).
-        m_engine.SetOptions(m_cfg.enabled, m_cfg.style, m_cfg.intensity,
-                            m_cfg.localTone, m_cfg.localStruct,
-                            m_cfg.skinStruct, m_cfg.autoMask);
-        LogRaw("panel: enabled=%d style=%d intensity=%d%% tone=%d%% struct=%d%% "
-               "skin=%d%% automask=%d",
-               m_cfg.enabled ? 1 : 0, m_cfg.style,
-               (int)(m_cfg.intensity * 100), (int)(m_cfg.localTone * 100),
-               (int)(m_cfg.localStruct * 100), (int)(m_cfg.skinStruct * 100),
-               m_cfg.autoMask ? 1 : 0);
+        m_cfg.enabled = s->reqEnabled != 0;
+        // The request block predates layers: it can describe exactly ONE set of
+        // parameters, so it edits the layer the panel is looking at (layer 1
+        // until someone selects another one). The in-process panel does not come
+        // through here at all -- it calls Engine::SetOptions() directly, which is
+        // also why skinStruct / autoMask were never mirrored into this struct.
+        // This path exists for an external writer, and "the current layer" is the
+        // only honest answer it can give; the chain's LENGTH is not something it
+        // can set either, and it is not something it can break.
+        m_engine.SetOptions(m_cfg.enabled, s->reqStyle, Clamp01(s->reqIntensity),
+                            Clamp01(s->reqLocalTone), Clamp01(s->reqLocalStruct),
+                            m_engine.OptSkin(), m_engine.OptAutoMask());
+        LogRaw("panel: enabled=%d layer=%d/%d style=%d intensity=%d%% tone=%d%% "
+               "struct=%d%% skin=%d%% automask=%d",
+               m_engine.OptEnabled() ? 1 : 0,
+               m_engine.OptSelLayer() + 1, m_engine.OptLayerCount(),
+               m_engine.OptStyle(), (int)(m_engine.OptIntensity() * 100),
+               (int)(m_engine.OptTone() * 100), (int)(m_engine.OptStruct() * 100),
+               (int)(m_engine.OptSkin() * 100), m_engine.OptAutoMask() ? 1 : 0);
         s->reqApplied = seq;
     }
 
@@ -2047,6 +2293,17 @@ public:
         s->dropEnabled   = m_engine.OptDropFrames() ? 1 : 0;
         s->dropPct       = (seen > 0) ? (float)(100.0 * (double)drp / (double)seen) : 0.0f;
         s->dropLagMs     = m_dropLagMs;
+        // How many passes this frame actually cost. `requested` is the chain the
+        // panel is set to, `active` is what the engine has built so far -- the
+        // two differ for the frame or two between "the user raised the count"
+        // and "the next frame created the missing features".
+        s->layersRequested = m_engine.OptLayerCount();
+        s->layersActive    = dlssnr::ActiveLayers();
+        // Which network this frame went through. `requested` is the panel/ini
+        // value, `applied` is what the live features were created with; they
+        // differ when the DLL refused the preset and the engine fell back.
+        s->modelRequested  = m_engine.OptModel();
+        s->modelApplied    = m_engine.AppliedModel();
         s->pid           = (long)GetCurrentProcessId();
         SetStatus(reasonOverride, "%s", m_statusText);
     }

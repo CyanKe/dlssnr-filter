@@ -3,16 +3,28 @@
 // Layout of one frame:
 //   CPU : memcpy the two NV12 planes into 256-byte-aligned upload buffers
 //   GPU : CopyTextureRegion -> yTex/uvTex
-//         [compute] nv12_to_rgba  -> texIn (RGBA8)
-//         NGX EvaluateFeature     (DLSSNR.Color=texIn, .Output=texOut)
+//         [compute] nv12_to_rgba  -> texA (RGBA8, ping-pong A)
+//         for k = 0..layerCount-1:
+//             NGX EvaluateFeature on features[k] (DLSSNR.Color=src, .Output=dst)
+//             swap src/dst                    (ping-pong A <-> B)
 //         [compute] rgba_to_nv12  -> outY/outUV
 //         CopyTextureRegion -> readback buffers
 //   CPU : memcpy the two planes out to the caller
+//
+// N layers are N full neural passes on N SEPARATE NGX features. The whole chain
+// is recorded into the one command list above, so a frame still costs one upload,
+// one fence wait and one readback however many layers it has. Why one feature per
+// layer (and not N passes on one) is the subject of the long note in
+// dlssnr_layers.h; the short version is that a feature owns its temporal history,
+// and a second pass on the same feature reads a history equal to its own input,
+// which doubles the temporal loop gain and makes flat areas pulse.
 
 #include "dlssnr_engine.h"
+#include "dlssnr_models.h"     // which network a preset selects, and its name
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <winver.h>            // GetFileVersionInfo / VerQueryValue (DllVersion)
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <stdio.h>
@@ -27,6 +39,7 @@
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "version.lib")   // DllVersion(): the DLL's file version
 
 namespace dlssnr {
 namespace {
@@ -217,15 +230,31 @@ void nv12_to_rgba(uint3 tid : SV_DispatchThreadID) {
 )HLSL";
 
 static const char* kSrcRgbaToNv12 = R"HLSL(
-cbuffer Params : register(b0) { uint W; uint H; };
-Texture2D<float4>   sRGB : register(t0);
+cbuffer Params : register(b0) { uint W; uint H; uint SW; uint SH; float Gain; };
+Texture2D<float4>   sRGB  : register(t0);
+// The frame as uploaded. Read only when Gain != 1, so leaving the feature off
+// costs neither a read nor a branch that can change the result.
+Texture2D<float4>   sOrig : register(t1);
 RWTexture2D<float>  uY   : register(u0);
 RWTexture2D<float2> uUV  : register(u1);
+
+// out = proc + (Gain-1) * (proc - orig)
+//
+// Gain == 1 returns `c` unchanged and never touches sOrig: that is what keeps
+// the off state bit-identical to the build before this feature existed.
+float4 ExtrapAt(int2 p) {
+    float4 c = sRGB.Load(int3(p, 0));
+    if (Gain != 1.0f) {
+        float4 o = sOrig.Load(int3(p, 0));
+        c.rgb = saturate(c.rgb + (Gain - 1.0f) * (c.rgb - o.rgb));
+    }
+    return c;
+}
 
 [numthreads(8,8,1)]
 void rgba_to_y(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= W || tid.y >= H) return;
-    float4 c = sRGB.Load(int3(tid.xy, 0));
+    float4 c = ExtrapAt((int2)tid.xy);
     int R = (int)(saturate(c.r) * 255.0 + 0.5);
     int G = (int)(saturate(c.g) * 255.0 + 0.5);
     int B = (int)(saturate(c.b) * 255.0 + 0.5);
@@ -246,7 +275,7 @@ void rgba_to_uv(uint3 tid : SV_DispatchThreadID) {
         for (int dx = 0; dx < 2; ++dx) {
             int x = (int)tid.x * 2 + dx;
             if (x >= (int)W) break;
-            float4 c = sRGB.Load(int3(x, y, 0));
+            float4 c = ExtrapAt(int2(x, y));
             sr += (int)(saturate(c.r) * 255.0 + 0.5);
             sg += (int)(saturate(c.g) * 255.0 + 0.5);
             sb += (int)(saturate(c.b) * 255.0 + 0.5);
@@ -367,8 +396,9 @@ void nv12_to_rgba_scale(uint3 tid : SV_DispatchThreadID) {
 )HLSL";
 
 static const char* kSrcRgbaToNv12Scale = R"HLSL(
-cbuffer Params : register(b0) { uint W; uint H; uint SW; uint SH; };
-Texture2D<float4>   sRGB : register(t0);
+cbuffer Params : register(b0) { uint W; uint H; uint SW; uint SH; float Gain; };
+Texture2D<float4>   sRGB  : register(t0);
+Texture2D<float4>   sOrig : register(t1);   // frame as uploaded (extrapolation)
 RWTexture2D<float>  uY   : register(u0);
 RWTexture2D<float2> uUV  : register(u1);
 
@@ -388,11 +418,37 @@ float4 FetchRGBA(float2 p) {
     return lerp(lerp(a, b, tx), lerp(c, d, tx), ty);
 }
 
+float4 FetchRGBAOrig(float2 p) {
+    const float fx = floor(p.x), fy = floor(p.y);
+    const float tx = p.x - fx,  ty = p.y - fy;
+    const int mx = (int)SW - 1, my = (int)SH - 1;
+    int x0 = (int)fx, y0 = (int)fy;
+    x0 = min(max(x0, 0), mx); y0 = min(max(y0, 0), my);
+    const int x1 = min(x0 + 1, mx), y1 = min(y0 + 1, my);
+    float4 a = sOrig.Load(int3(x0, y0, 0));
+    float4 b = sOrig.Load(int3(x1, y0, 0));
+    float4 c = sOrig.Load(int3(x0, y1, 0));
+    float4 d = sOrig.Load(int3(x1, y1, 0));
+    return lerp(lerp(a, b, tx), lerp(c, d, tx), ty);
+}
+
+// Blending after the bilinear taps is exact here: the blend is linear and both
+// textures are sampled at the same coordinates, so lerp-then-blend and
+// blend-then-lerp agree.
+float4 ExtrapFetch(float2 uv) {
+    float4 c = FetchRGBA(uv);
+    if (Gain != 1.0f) {
+        float4 o = FetchRGBAOrig(uv);
+        c.rgb = saturate(c.rgb + (Gain - 1.0f) * (c.rgb - o.rgb));
+    }
+    return c;
+}
+
 [numthreads(8,8,1)]
 void rgba_to_y_scale(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= W || tid.y >= H) return;
     const float rx = (float)SW / (float)W, ry = (float)SH / (float)H;
-    float4 c = FetchRGBA(float2(((float)tid.x + 0.5) * rx - 0.5,
+    float4 c = ExtrapFetch(float2(((float)tid.x + 0.5) * rx - 0.5,
                                 ((float)tid.y + 0.5) * ry - 0.5));
     int R = (int)(saturate(c.r) * 255.0 + 0.5);
     int G = (int)(saturate(c.g) * 255.0 + 0.5);
@@ -407,7 +463,7 @@ void rgba_to_uv_scale(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= cw || tid.y >= ch) return;
     // A chroma sample covers video luma [2x, 2x+2), so its centre is luma 2x+1.
     const float rx = (float)SW / (float)W, ry = (float)SH / (float)H;
-    float4 c = FetchRGBA(float2(((float)tid.x * 2.0 + 1.0) * rx - 0.5,
+    float4 c = ExtrapFetch(float2(((float)tid.x * 2.0 + 1.0) * rx - 0.5,
                                 ((float)tid.y * 2.0 + 1.0) * ry - 0.5));
     int R = (int)(saturate(c.r) * 255.0 + 0.5);
     int G = (int)(saturate(c.g) * 255.0 + 0.5);
@@ -419,7 +475,32 @@ void rgba_to_uv_scale(uint3 tid : SV_DispatchThreadID) {
 )HLSL";
 
 // --------------------------------------------------------------- state
-enum { kDescCount = 9 };
+// Fixed descriptor-heap layout, and the single source of truth for every
+// DescGpu()/DescCpu() call -- do NOT hand-count slots at a call site. The
+// single-feature engine could afford a "texIn is only ever written, texOut is
+// only ever read" layout; a chain cannot: every layer but the first reads a
+// texture that a previous layer wrote as a UAV, and WHICH texture is the last
+// output depends on the parity of the layer count. So both ping-pong textures
+// carry a UAV and an SRV. The trap this closes is silent: bind the RGBA8->NV12
+// pass to the wrong SRV and it just converts the input back, producing a filter
+// that runs, looks plausible and does nothing.
+enum {
+    kDescSrvY          = 0,   // SRV yTex
+    kDescSrvUV         = 1,   // SRV uvTex
+    kDescUavA          = 2,   // UAV texA  (NV12->RGBA writes here)
+    kDescSrvA          = 3,   // SRV texA  (read when the chain ends on texA)
+    kDescUavB          = 4,   // UAV texB  (NGX output target on odd parity)
+    kDescSrvB          = 5,   // SRV texB  (read when the chain ends on texB)
+    kDescUavOutY       = 6,   // UAV outYTex
+    kDescUavOutUV      = 7,   // UAV outUVTex
+    kDescUavZeroMV     = 8,   // UAV zeroMV    (needed by the one-time clear)
+    kDescUavZeroDepth  = 9,   // UAV zeroDepth (needed by the one-time clear)
+    kDescSrvOrig       = 10,  // SRV texOrig (the frame as uploaded; extrapolation
+                              // reads it, so it needs its own slot and NOT a
+                              // reuse of texA/texB -- which one holds the last
+                              // output depends on the layer-count parity)
+    kDescCount         = 11
+};
 
 struct State {
     ID3D12Device*         dev = nullptr;
@@ -444,7 +525,8 @@ struct State {
 
     // frame resources
     ID3D12Resource* yTex = nullptr, * uvTex = nullptr;
-    ID3D12Resource* texIn = nullptr, * texOut = nullptr;
+    ID3D12Resource* texA = nullptr, * texB = nullptr;   // RGBA8 ping-pong
+    ID3D12Resource* texOrig = nullptr;                  // the frame as uploaded
     ID3D12Resource* outYTex = nullptr, * outUVTex = nullptr;
     ID3D12Resource* zeroMV = nullptr, * zeroDepth = nullptr;
     ID3D12Resource* upY = nullptr, * upUV = nullptr;
@@ -459,12 +541,23 @@ struct State {
     FnEvaluateFeature fnEval = nullptr;
     FnReleaseFeature fnRelease = nullptr;
 
-    NVSDK_NGX_Handle*    feature = nullptr;
-    NVSDK_NGX_Parameter* params = nullptr;
+    // One NGX feature per layer: a feature owns its temporal history, so sharing
+    // one across layers doubles the temporal loop gain (see dlssnr_layers.h).
+    // Grown lazily by EnsureFeatures(); existing handles are NEVER released on a
+    // layer-count change, only on Shutdown/resolution change.
+    NVSDK_NGX_Handle*    features[kMaxLayers] = {};
+    int                  nFeatures = 0;
+    NVSDK_NGX_Parameter* params = nullptr;   // one shared param block, N features
 
     int w = 0, h = 0;             // the video size: what goes in and comes out
     int sw = 0, sh = 0;            // the size the NETWORK runs at (== w,h at 100%)
     int scalePct = 100;            // 100 or 50
+    // Which network the features are created with (DLSSNR.Hint.Render.Preset).
+    // Stored here, not passed down the call chain, because the hint is written in
+    // EnsureNgxParams() -- one shared parameter block, many feature creations --
+    // and because the fallback below has to be able to change it mid-session.
+    int modelPreset = 0;           // as applied
+    bool modelFellBack = false;    // a requested preset was refused -> using 0
     Options opt;
     bool ready = false;
 };
@@ -557,10 +650,9 @@ static bool CreateRootSigAndPipelines() {
     D3D12_ROOT_PARAMETER rp[5] = {};
     rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     rp[0].Constants.ShaderRegister = 0;
-    // Four, not two: the half-resolution shaders need both the video size (W,H)
-    // and the network size (SW,SH), and the native shaders simply ignore the
-    // extra two constants.
-    rp[0].Constants.Num32BitValues = 4;
+    // W, H, SW, SH and the extrapolation gain, padded to eight so the count is
+    // the same on every dispatch. The native shaders ignore SW/SH.
+    rp[0].Constants.Num32BitValues = 8;
     rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     for (int i = 0; i < 4; ++i) {
         rp[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -634,8 +726,11 @@ static bool CreateFrameResources(int w, int h, int sw, int sh) {
 
     g.yTex     = CreateTex(g.dev, DXGI_FORMAT_R8_UNORM,     w, h, true);
     g.uvTex    = CreateTex(g.dev, DXGI_FORMAT_R8G8_UNORM,   cw, ch, true);
-    g.texIn    = CreateTex(g.dev, DXGI_FORMAT_R8G8B8A8_UNORM, sw, sh, true);
-    g.texOut   = CreateTex(g.dev, DXGI_FORMAT_R8G8B8A8_UNORM, sw, sh, true);
+    g.texA     = CreateTex(g.dev, DXGI_FORMAT_R8G8B8A8_UNORM, sw, sh, true);
+    g.texB     = CreateTex(g.dev, DXGI_FORMAT_R8G8B8A8_UNORM, sw, sh, true);
+    // Only read by the extrapolation term, but created unconditionally: a gain
+    // change must not rebuild the session (that costs ~0.2 s of pass-through).
+    g.texOrig  = CreateTex(g.dev, DXGI_FORMAT_R8G8B8A8_UNORM, sw, sh, true);
     g.outYTex  = CreateTex(g.dev, DXGI_FORMAT_R8_UNORM,     w, h, true);
     g.outUVTex = CreateTex(g.dev, DXGI_FORMAT_R8G8_UNORM,   cw, ch, true);
     g.zeroMV   = CreateTex(g.dev, DXGI_FORMAT_R16G16_FLOAT, sw, sh, true);
@@ -646,16 +741,14 @@ static bool CreateFrameResources(int w, int h, int sw, int sh) {
     g.rbY  = CreateBuf(g.dev, (UINT64)g.yPitch * h,      D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     g.rbUV = CreateBuf(g.dev, (UINT64)g.uvPitch * ch,    D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
 
-    if (!g.yTex || !g.uvTex || !g.texIn || !g.texOut || !g.outYTex || !g.outUVTex ||
+    if (!g.yTex || !g.uvTex || !g.texA || !g.texB || !g.texOrig || !g.outYTex || !g.outUVTex ||
         !g.zeroMV || !g.zeroDepth || !g.upY || !g.upUV || !g.rbY || !g.rbUV) {
         ELog("frame resource allocation failed at %dx%d (network %dx%d)", w, h, sw, sh);
         return false;
     }
 
-    // Descriptor slots, fixed layout:
-    //   0 SRV yTex   1 SRV uvTex   2 UAV texIn   3 SRV texIn
-    //   4 UAV outY   5 UAV outUV    6 UAV zeroMV 7 UAV zeroDepth
-    //   8 SRV texOut  <-- the RGBA8 -> NV12 pass reads THIS, not texIn
+    // Descriptor slots: the names live in the enum near the top of this file.
+    // Everything below must use kDesc* -- see the "silent wrong slot" note there.
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     hd.NumDescriptors = kDescCount;
@@ -663,15 +756,17 @@ static bool CreateFrameResources(int w, int h, int sw, int sh) {
     if (FAILED(g.dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g.heap)))) { ELog("descriptor heap failed"); return false; }
     g.descStride = g.dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-    MakeSrv(g.yTex,     DXGI_FORMAT_R8_UNORM,           0);
-    MakeSrv(g.uvTex,    DXGI_FORMAT_R8G8_UNORM,         1);
-    MakeUav(g.texIn,    DXGI_FORMAT_R8G8B8A8_UNORM,     2);
-    MakeSrv(g.texIn,    DXGI_FORMAT_R8G8B8A8_UNORM,     3);
-    MakeUav(g.outYTex,  DXGI_FORMAT_R8_UNORM,           4);
-    MakeUav(g.outUVTex, DXGI_FORMAT_R8G8_UNORM,         5);
-    MakeUav(g.zeroMV,   DXGI_FORMAT_R16G16_FLOAT,       6);
-    MakeUav(g.zeroDepth,DXGI_FORMAT_R32_FLOAT,          7);
-    MakeSrv(g.texOut,   DXGI_FORMAT_R8G8B8A8_UNORM,     8);
+    MakeSrv(g.yTex,     DXGI_FORMAT_R8_UNORM,           kDescSrvY);
+    MakeSrv(g.uvTex,    DXGI_FORMAT_R8G8_UNORM,         kDescSrvUV);
+    MakeUav(g.texA,     DXGI_FORMAT_R8G8B8A8_UNORM,     kDescUavA);
+    MakeSrv(g.texA,     DXGI_FORMAT_R8G8B8A8_UNORM,     kDescSrvA);
+    MakeUav(g.texB,     DXGI_FORMAT_R8G8B8A8_UNORM,     kDescUavB);
+    MakeSrv(g.texB,     DXGI_FORMAT_R8G8B8A8_UNORM,     kDescSrvB);
+    MakeSrv(g.texOrig,  DXGI_FORMAT_R8G8B8A8_UNORM,     kDescSrvOrig);
+    MakeUav(g.outYTex,  DXGI_FORMAT_R8_UNORM,           kDescUavOutY);
+    MakeUav(g.outUVTex, DXGI_FORMAT_R8G8_UNORM,         kDescUavOutUV);
+    MakeUav(g.zeroMV,   DXGI_FORMAT_R16G16_FLOAT,       kDescUavZeroMV);
+    MakeUav(g.zeroDepth,DXGI_FORMAT_R32_FLOAT,          kDescUavZeroDepth);
 
     // Deterministic zero guidance: the host DLL never wrote these, which leaves
     // the network reading whatever was in VRAM. Zeroing is one clear pass.
@@ -680,8 +775,8 @@ static bool CreateFrameResources(int w, int h, int sw, int sh) {
     BarrierOn(g.cmd, g.zeroMV,    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     BarrierOn(g.cmd, g.zeroDepth, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     const float z4[4] = {0,0,0,0};
-    g.cmd->ClearUnorderedAccessViewFloat(DescGpu(6), DescCpu(6), g.zeroMV, z4, 0, nullptr);
-    g.cmd->ClearUnorderedAccessViewFloat(DescGpu(7), DescCpu(7), g.zeroDepth, z4, 0, nullptr);
+    g.cmd->ClearUnorderedAccessViewFloat(DescGpu(kDescUavZeroMV), DescCpu(kDescUavZeroMV), g.zeroMV, z4, 0, nullptr);
+    g.cmd->ClearUnorderedAccessViewFloat(DescGpu(kDescUavZeroDepth), DescCpu(kDescUavZeroDepth), g.zeroDepth, z4, 0, nullptr);
     BarrierOn(g.cmd, g.zeroMV,    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
     BarrierOn(g.cmd, g.zeroDepth, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
     g.cmd->Close();
@@ -728,8 +823,13 @@ static bool CreateDeviceQueueAndCmd() {
     return true;
 }
 
-static bool TryInitNgx() {
-    if (g_ngxInited) return true;
+// Loads nvngx_dlssnr.dll if it is not loaded yet and returns the handle. The
+// engine NEVER unloads it (its "NGX already inited" latch lives inside the image
+// -- see dlssnr_engine.h), so this is the same handle TryInitNgx() would use, and
+// calling it from the capability scan costs nothing after the first time.
+static HMODULE EnsureSnippetLoaded() {
+    if (g.snippet) return g.snippet;
+    if (!g_dirW[0]) return nullptr;
     wchar_t dll[MAX_PATH];
     swprintf_s(dll, L"%s\\nvngx_dlssnr.dll", g_dirW);
     // LOAD_WITH_ALTERED_SEARCH_PATH matters: nvngx_dlssnr.dll pulls in its own
@@ -738,10 +838,13 @@ static bool TryInitNgx() {
     // fails with ERROR_MOD_NOT_FOUND (126). This flag makes the search start in
     // the loaded DLL's own directory.
     g.snippet = LoadLibraryExW(dll, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-    if (!g.snippet) {
-        ELog("LoadLibraryExW(%ls) failed err=%u", dll, GetLastError());
-        return false;
-    }
+    if (!g.snippet) ELog("LoadLibraryExW(%ls) failed err=%u", dll, GetLastError());
+    return g.snippet;
+}
+
+static bool TryInitNgx() {
+    if (g_ngxInited) return true;
+    if (!EnsureSnippetLoaded()) return false;
     g.fnInitExt = (FnInitExt)GetProcAddress(g.snippet, "NVSDK_NGX_D3D12_Init_Ext");
     g.fnCreate  = (FnCreateFeature)GetProcAddress(g.snippet, "NVSDK_NGX_D3D12_CreateFeature");
     g.fnEval    = (FnEvaluateFeature)GetProcAddress(g.snippet, "NVSDK_NGX_D3D12_EvaluateFeature");
@@ -769,9 +872,14 @@ static bool TryInitNgx() {
     return true;
 }
 
-static bool CreateFeatureAt(int w, int h) {
-    if (NVSDK_NGX_D3D12_GetCapabilityParameters(&g.params) != NVSDK_NGX_Result_Success || !g.params) {
-        ELog("GetCapabilityParameters failed"); return false;
+// One parameter block is shared by every feature; the geometry half of it is
+// written once per session. GetCapabilityParameters is what proves the SDK static
+// lib and the runtime agree, so it is only called when the block does not exist.
+static bool EnsureNgxParams(int w, int h) {
+    if (!g.params) {
+        if (NVSDK_NGX_D3D12_GetCapabilityParameters(&g.params) != NVSDK_NGX_Result_Success || !g.params) {
+            ELog("GetCapabilityParameters failed"); return false;
+        }
     }
     g.params->Set(NVSDK_NGX_Parameter_Width,  (uint32_t)w);
     g.params->Set(NVSDK_NGX_Parameter_Height, (uint32_t)h);
@@ -784,17 +892,43 @@ static bool CreateFeatureAt(int w, int h) {
     g.params->Set("DLSSNR.Upscaling",    0u);
     g.params->Set("DLSSNR.Scale",        1.0f);
     g.params->Set("DLSSNR.ScalingRatio", 1.0f);
-    g.params->Set("DLSSNR.Hint.Render.Preset", 0);
-    g.params->Set("DLSSNR.Style",        g.opt.style);
-    g.params->Set("DLSSNR.Intensity",    g.opt.intensity);
-    g.params->Set("DLSSNR.LocalToneStrength",      g.opt.localTone);
-    g.params->Set("DLSSNR.LocalStructureStrength", g.opt.localStruct);
-    g.params->Set("DLSSNR.SkinStructureStrength",  g.opt.skinStruct);
-    g.params->Set("DLSSNR.UseAutoMask",  g.opt.autoMask);
-    g.params->Set("DLSSNR.UICorrection", g.opt.uiCorrection);
+    // WHICH network to run, out of the ones this DLL carries. It is a
+    // FEATURE-CREATION parameter (not an evaluate-time one), which is why
+    // changing it is a session rebuild and why it is written here rather than
+    // per frame in SetLayerParams(). 0 = the DLL's own default. See
+    // src\dlssnr_models.h for what 1 and 2 mean and how that was established.
+    g.params->Set("DLSSNR.Hint.Render.Preset", g.modelPreset);
     g.params->Set(NVSDK_NGX_Parameter_CreationNodeMask,   1u);
     g.params->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
     g.params->Set(NVSDK_NGX_Parameter_PerfQualityValue, (int)NVSDK_NGX_PerfQuality_Value_Balanced);
+    return true;
+}
+
+// One layer's settings onto the shared parameter block. Called twice per layer:
+// once with the layer's own values just before fnCreate -- Style in particular is
+// a FEATURE-CREATION parameter, so a layer created later must be created with its
+// own settings, not whatever the panel happened to push last -- and once per layer
+// per frame (see the chain loop), so a live slider change reaches the network
+// without re-creating anything.
+static void SetLayerParams(const LayerOptions& L) {
+    g.params->Set("DLSSNR.Style",                   L.style);
+    g.params->Set("DLSSNR.Intensity",               L.intensity);
+    g.params->Set("DLSSNR.LocalToneStrength",       L.localTone);
+    g.params->Set("DLSSNR.LocalStructureStrength",  L.localStruct);
+    g.params->Set("DLSSNR.SkinStructureStrength",   L.skinStruct);
+    g.params->Set("DLSSNR.UseAutoMask",             L.autoMask);
+    g.params->Set("DLSSNR.UICorrection",            L.uiCorrection);
+}
+
+// Create ONE feature with its own creation parameters. Feature creation needs a
+// command list and NGX submits its own setup work through it, so each feature gets
+// a short-lived list, submitted and fenced before returning. `out` is set only on
+// success; the caller stores the handle.
+static bool CreateFeatureForLayer(int w, int h, const LayerOptions& L,
+                                  NVSDK_NGX_Handle** out) {
+    *out = nullptr;
+    if (!EnsureNgxParams(w, h)) return false;
+    SetLayerParams(L);
 
     ID3D12CommandAllocator* a = nullptr;
     ID3D12GraphicsCommandList* c = nullptr;
@@ -802,22 +936,67 @@ static bool CreateFeatureAt(int w, int h) {
         FAILED(g.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a, nullptr, IID_PPV_ARGS(&c)))) {
         ELog("command list for CreateFeature failed"); return false;
     }
-    NVSDK_NGX_Result r = g.fnCreate(c, (NVSDK_NGX_Feature)18, g.params, &g.feature);
+    NVSDK_NGX_Handle* handle = nullptr;
+    NVSDK_NGX_Result r = g.fnCreate(c, (NVSDK_NGX_Feature)18, g.params, &handle);
+    if ((r != NVSDK_NGX_Result_Success || !handle) && g.modelPreset != 0) {
+        // A preset this DLL cannot serve must not cost the picture. Fall back to
+        // the DLL's own default, remember that we did, and say so loudly: the
+        // panel reads the APPLIED value back, so the user sees "Auto" instead of
+        // a silent mismatch, and the log has the reason.
+        ELog("CreateFeature with preset %d failed (0x%08X) -> retrying with the "
+             "DLL default (0)", g.modelPreset, (unsigned)r);
+        g.modelPreset   = 0;
+        g.modelFellBack = true;
+        g.params->Set("DLSSNR.Hint.Render.Preset", 0);
+        handle = nullptr;
+        r = g.fnCreate(c, (NVSDK_NGX_Feature)18, g.params, &handle);
+    }
     c->Close();
     ID3D12CommandList* lists[] = { c };
     g.queue->ExecuteCommandLists(1, lists);
     g.queue->Signal(g.fence, ++g.fenceValue);
     WaitForFence(g.fence, g.fenceEvent, g.fenceValue);
     a->Release(); c->Release();
-    if (r != NVSDK_NGX_Result_Success || !g.feature) { ELog("CreateFeature 0x%08X", (unsigned)r); return false; }
+    if (r != NVSDK_NGX_Result_Success || !handle) {
+        ELog("CreateFeature 0x%08X", (unsigned)r); return false;
+    }
+    *out = handle;
+    return true;
+}
+
+// Grow the feature set up to `n`, creating ONLY the missing handles. Existing
+// features are never released here: NGX and the snippet keep process-wide state,
+// and the toolkit learned to keep growth lazy, so a user dragging the layer count
+// up and down does not churn features. Called from ProcessNv12, which is the only
+// point that has the queue and a free command list.
+static bool EnsureFeatures(int n) {
+    if (n < 1) n = 1;
+    if (n > kMaxLayers) { ELog("EnsureFeatures: %d > %d", n, kMaxLayers); return false; }
+    for (int i = 0; i < n; ++i) {
+        if (g.features[i]) continue;                 // keep what we have
+        NVSDK_NGX_Handle* h = nullptr;
+        if (!CreateFeatureForLayer(g.sw, g.sh, g.opt.layers[i], &h)) {
+            ELog("layer %d: CreateFeature failed", i); return false;
+        }
+        g.features[i] = h;
+        if (g.nFeatures < i + 1) g.nFeatures = i + 1;
+        ELog("layer %d: own NGX feature created", i);
+    }
     return true;
 }
 
 }  // namespace
 
 // ------------------------------------------------------------- public API
+
+// Defined with the capability scan further down. Init() validates the requested
+// preset against it BEFORE creating a feature, because a DLL may well ignore a
+// preset it does not carry instead of failing -- and then "applied" would be a
+// lie (see the comment at the call site).
+static bool DllCarriesWeight(const char* name);
+
 bool Init(int width, int height, const wchar_t* moduleDir, const char* logPath,
-          int scalePercent) {
+          int scalePercent, int modelPreset) {
     if (!g_logCsInit) { InitializeCriticalSection(&g_logCs); g_logCsInit = true; }
     if (logPath && logPath[0]) strncpy_s(g_logPath, sizeof(g_logPath), logPath, _TRUNCATE);
     if (moduleDir && moduleDir[0]) wcsncpy_s(g_dirW, moduleDir, _TRUNCATE);
@@ -844,22 +1023,56 @@ bool Init(int width, int height, const wchar_t* moduleDir, const char* logPath,
     if (!g.dev && !CreateDeviceQueueAndCmd()) return false;
     if (!g.rootSig && !CreateRootSigAndPipelines()) return false;
 
+    // Which network to create the features with. Set BEFORE Shutdown()/creation
+    // because the hint is a creation parameter (EnsureNgxParams writes it), and
+    // the fallback latch is cleared here so it reports THIS request.
+    g.modelPreset   = ModelClamp(modelPreset);
+    g.modelFellBack = false;
+    // Check the request against what the DLL actually carries, before creating
+    // anything. CreateFeature's own failure is not enough evidence: a DLL that
+    // does not have the requested network may simply ignore the hint, and then
+    // ModelPreset() would report a network that never ran. The scan of the
+    // loaded image is the authority, so it decides here.
+    if (g.modelPreset != 0) {
+        const char* need = ModelResource(g.modelPreset);
+        if (need && need[0] && !DllCarriesWeight(need)) {
+            ELog("model: preset %d needs %s, which this nvngx_dlssnr.dll does not "
+                 "carry -> using the DLL's default (0)", g.modelPreset, need);
+            g.modelPreset   = 0;
+            g.modelFellBack = true;
+        }
+    }
+
     Shutdown();                                   // drop any previous geometry
     if (!TryInitNgx()) return false;
 
-    bool ok = CreateFrameResources(width, height, sw, sh) && CreateFeatureAt(sw, sh);
+    bool ok = CreateFrameResources(width, height, sw, sh) && EnsureFeatures(g.opt.layerCount);
     if (!ok && scale != 100) {
         ELog("engine init at %d%% (%dx%d) failed -> retrying at native %dx%d",
              scale, sw, sh, width, height);
         Shutdown();                               // release whatever got half-built
         scale = 100; sw = width; sh = height;
-        ok = CreateFrameResources(width, height, sw, sh) && CreateFeatureAt(sw, sh);
+        ok = CreateFrameResources(width, height, sw, sh) && EnsureFeatures(g.opt.layerCount);
     }
     if (!ok) return false;
 
     g.scalePct = scale;
     g.ready = true;
     ELog("engine ready at %dx%d (network %dx%d, scale %d%%)", width, height, sw, sh, scale);
+    {
+        // One line that answers "which network is actually running?" without
+        // reading the DLL by hand: the file version, the resource the request
+        // names, and whether the DLL refused it.
+        wchar_t ver[32] = L"";
+        DllVersion(ver, _countof(ver));
+        const char* res = ModelResource(g.modelPreset);
+        ELog("engine model: preset %d%s%s (dll %ls)", g.modelPreset,
+             res[0] ? " -> " : "", res[0] ? res : " (DLL default)",
+             ver[0] ? ver : L"unknown");
+        if (g.modelFellBack)
+            ELog("engine model: the requested preset was REFUSED by the DLL; "
+                 "running its default instead");
+    }
     return true;
 }
 
@@ -869,15 +1082,17 @@ void Shutdown() {
         g.queue->Signal(g.fence, g.fenceValue);
         WaitForFence(g.fence, g.fenceEvent, g.fenceValue);
     }
-    if (g.feature) {
-        if (g.fnRelease) g.fnRelease(g.feature);
-        else NVSDK_NGX_D3D12_ReleaseFeature(g.feature);
-        g.feature = nullptr;
+    for (int i = 0; i < kMaxLayers; ++i) {   // one feature per layer, all of them
+        if (!g.features[i]) continue;
+        if (g.fnRelease) g.fnRelease(g.features[i]);
+        else NVSDK_NGX_D3D12_ReleaseFeature(g.features[i]);
+        g.features[i] = nullptr;
     }
+    g.nFeatures = 0;
     if (g.params) { NVSDK_NGX_D3D12_DestroyParameters(g.params); g.params = nullptr; }
     g.ready = false;
 
-    ID3D12Resource* res[] = { g.yTex, g.uvTex, g.texIn, g.texOut, g.outYTex, g.outUVTex,
+    ID3D12Resource* res[] = { g.yTex, g.uvTex, g.texA, g.texB, g.texOrig, g.outYTex, g.outUVTex,
                               g.zeroMV, g.zeroDepth, g.upY, g.upUV, g.rbY, g.rbUV };
     for (auto*& r : res) { if (r) { r->Release(); r = nullptr; } }
     if (g.heap) { g.heap->Release(); g.heap = nullptr; }
@@ -892,17 +1107,145 @@ int  Height() { return g.h; }
 int  ProcWidth()  { return g.sw; }   // the size the network actually runs at
 int  ProcHeight() { return g.sh; }
 int  ProcScalePercent() { return g.scalePct; }
+int  ActiveLayers() { return g.nFeatures; }   // features live right now
+int  ModelPreset()  { return g.modelPreset; }
+bool ModelFellBack() { return g.modelFellBack; }
+
+void SetModuleDir(const wchar_t* dir) {
+    if (!dir || !dir[0]) return;
+    wcsncpy_s(g_dirW, dir, _TRUNCATE);
+}
+
+// --- what the loaded DLL can serve -----------------------------------------
+// Reads the module's own image for the ASCII "WEIGHTS_*" resource names. They
+// are plain NUL-terminated strings in .rdata -- the same evidence
+// tools\inspect_nr_dll.py prints from the file on disk -- and matching on the
+// RESOURCE NAME rather than on the file version is what lets a DLL this build
+// has never seen be described correctly (310.8.0 has WEIGHTS_HT alone; 310.9.16
+// has WEIGHTS_HT and WEIGHTS_CC_SMALL_FP8).
+//
+// Cached: the image is 254 MB on 310.9.16 and the panel asks on every open.
+static DllWeight g_weights[kDllWeightMax];
+static int       g_weightCount = -1;      // -1 = not scanned yet
+
+static bool WeightNameChar(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+static int ScanWeightsOnce() {
+    if (g_weightCount >= 0) return g_weightCount;
+    g_weightCount = 0;
+
+    HMODULE mod = EnsureSnippetLoaded();
+    if (!mod) return g_weightCount;
+    const unsigned char* base = (const unsigned char*)mod;
+    const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return g_weightCount;
+    const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return g_weightCount;
+    const size_t size = nt->OptionalHeader.SizeOfImage;
+
+    static const char kNeedle[] = "WEIGHTS_";
+    const size_t kLen = sizeof(kNeedle) - 1;
+    size_t off = 0;
+    while (g_weightCount < kDllWeightMax && off + kLen < size) {
+        const void* hit = memchr(base + off, 'W', size - off - kLen);
+        if (!hit) break;
+        off = (size_t)((const char*)hit - (const char*)base);
+        if (memcmp(base + off, kNeedle, kLen) == 0) {
+            size_t n = 0;
+            while (off + n < size && n < (size_t)kDllWeightNameMax - 1 &&
+                   WeightNameChar((char)base[off + n]))
+                ++n;
+            if (n >= kLen && off + n < size && base[off + n] == '\0') {
+                char name[kDllWeightNameMax];
+                memcpy(name, base + off, n);
+                name[n] = '\0';
+                bool seen = false;
+                for (int k = 0; k < g_weightCount && !seen; ++k)
+                    seen = (strcmp(g_weights[k].name, name) == 0);
+                if (!seen) {
+                    DllWeight& w = g_weights[g_weightCount++];
+                    strncpy_s(w.name, sizeof(w.name), name, _TRUNCATE);
+                    w.preset = -1;
+                    const ModelInfo* t = ModelTable();
+                    for (int k = 0; t[k].zh; ++k)
+                        if (t[k].resource[0] && strcmp(t[k].resource, name) == 0) {
+                            w.preset = t[k].preset;
+                            break;
+                        }
+                }
+            }
+        }
+        ++off;
+    }
+
+    ELog("dll: %d WEIGHTS_* resource(s) in the loaded image", g_weightCount);
+    for (int k = 0; k < g_weightCount; ++k)
+        ELog("dll:   %s -> preset %d", g_weights[k].name, g_weights[k].preset);
+    return g_weightCount;
+}
+
+int DllWeights(DllWeight* out, int cap) {
+    const int n = ScanWeightsOnce();
+    if (!out || cap <= 0) return n;
+    const int c = (n < cap) ? n : cap;
+    for (int i = 0; i < c; ++i) out[i] = g_weights[i];
+    return n;
+}
+
+static bool DllCarriesWeight(const char* name) {
+    if (!name || !name[0]) return true;
+    ScanWeightsOnce();
+    for (int i = 0; i < g_weightCount; ++i)
+        if (strcmp(g_weights[i].name, name) == 0) return true;
+    return false;
+}
+
+void DllVersion(wchar_t* out, int cch) {
+    if (!out || cch <= 0) return;
+    out[0] = L'\0';
+    if (!g_dirW[0]) return;
+    wchar_t path[MAX_PATH];
+    swprintf_s(path, L"%s\\nvngx_dlssnr.dll", g_dirW);
+    DWORD dummy = 0;
+    const DWORD bytes = GetFileVersionInfoSizeW(path, &dummy);
+    if (!bytes) return;
+    void* buf = malloc(bytes);
+    if (!buf) return;
+    if (GetFileVersionInfoW(path, 0, bytes, buf)) {
+        VS_FIXEDFILEINFO* fi = nullptr;
+        UINT len = 0;
+        if (VerQueryValueW(buf, L"\\", (void**)&fi, &len) && fi &&
+            fi->dwSignature == 0xFEEF04BD) {
+            _snwprintf_s(out, (size_t)cch, _TRUNCATE, L"%u.%u.%u.%u",
+                         (unsigned)HIWORD(fi->dwFileVersionMS),
+                         (unsigned)LOWORD(fi->dwFileVersionMS),
+                         (unsigned)HIWORD(fi->dwFileVersionLS),
+                         (unsigned)LOWORD(fi->dwFileVersionLS));
+        }
+    }
+    free(buf);
+}
 
 void SetOptions(const Options& o) {
+    // Store only. Per-layer parameters are bound per layer at evaluate time (see
+    // the chain loop in ProcessNv12), so a live slider change needs no feature
+    // re-creation and no parameter push here -- the next frame re-reads g.opt.
     g.opt = o;
-    if (!g.params) return;
-    g.params->Set("DLSSNR.Style",                   g.opt.style);
-    g.params->Set("DLSSNR.Intensity",               g.opt.intensity);
-    g.params->Set("DLSSNR.LocalToneStrength",       g.opt.localTone);
-    g.params->Set("DLSSNR.LocalStructureStrength",  g.opt.localStruct);
-    g.params->Set("DLSSNR.SkinStructureStrength",   g.opt.skinStruct);
-    g.params->Set("DLSSNR.UseAutoMask",             g.opt.autoMask);
-    g.params->Set("DLSSNR.UICorrection",            g.opt.uiCorrection);
+    g.opt.layerCount = LayerClampCount(o.layerCount);   // 1..kMaxLayers
+    // Defensive: the wrapper clamps in panel units, but SetOptions is public and
+    // style/mask index NGX enums. Floats are left alone; the network saturates.
+    for (int i = 0; i < kMaxLayers; ++i) {
+        LayerOptions& L = g.opt.layers[i];
+        if (L.style < 0) L.style = 0; else if (L.style > 3) L.style = 3;
+        L.autoMask     = L.autoMask ? 1 : 0;
+        L.uiCorrection = L.uiCorrection ? 1 : 0;
+    }
+    // Extrapolation is a gain, not a layer count: below 1 it would UNDO the
+    // network's correction, which is not what the control says it does.
+    if (g.opt.extrapPct < 100) g.opt.extrapPct = 100;
+    if (g.opt.extrapPct > 400) g.opt.extrapPct = 400;
 }
 
 bool ProcessNv12(const uint8_t* inY,  int inYStride,
@@ -919,6 +1262,17 @@ bool ProcessNv12(const uint8_t* inY,  int inYStride,
     const UINT SW = (UINT)g.sw, SH = (UINT)g.sh;
     const bool scaled = (g.scalePct != 100);
 
+    // Grow the feature set to the requested chain length BEFORE recording. This
+    // is the lazy point the toolkit's chain() used: SetOptions can be called by
+    // the panel at any time, but creating a feature needs the queue and a command
+    // list, and this is the only place that has both. Only MISSING features are
+    // created -- an existing feature's temporal history survives a count change.
+    const int nLayers = g.opt.layerCount;
+    if (!EnsureFeatures(nLayers)) {
+        ELog("ProcessNv12: EnsureFeatures(%d) failed", nLayers);
+        return false;
+    }
+
     // ---- CPU: stage the two planes into 256-byte-aligned upload buffers ----
     D3D12_RANGE noRead{ 0, 0 };
     void* p = nullptr;
@@ -934,8 +1288,10 @@ bool ProcessNv12(const uint8_t* inY,  int inYStride,
     ID3D12DescriptorHeap* heaps[] = { g.heap };
     g.cmd->SetDescriptorHeaps(1, heaps);
     g.cmd->SetComputeRootSignature(g.rootSig);
-    const UINT dims[4] = { W, H, SW, SH };
-    g.cmd->SetComputeRoot32BitConstants(0, 4, dims, 0);
+    const float gain = g.opt.extrapPct / 100.0f;
+    UINT dims[8] = { W, H, SW, SH, 0u, 0u, 0u, 0u };
+    memcpy(&dims[4], &gain, sizeof(float));   // [4] = gain, as IEEE bits
+    g.cmd->SetComputeRoot32BitConstants(0, 8, dims, 0);
 
     // NV12 planes -> textures
     BarrierOn(g.cmd, g.yTex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -945,26 +1301,43 @@ bool ProcessNv12(const uint8_t* inY,  int inYStride,
     CopyToTex(g.cmd, g.uvTex, g.upUV, cw, ch, g.uvPitch, DXGI_FORMAT_R8G8_UNORM);
     BarrierOn(g.cmd, g.uvTex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-    // ---- compute: NV12 -> RGBA8, at the NETWORK size ----
-    BarrierOn(g.cmd, g.texIn, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // ---- compute: NV12 -> RGBA8 into texA, at the NETWORK size ----
+    // Deliberately left in UNORDERED_ACCESS: layer 0's src barrier below then
+    // takes every layer's src from UAV -> SRV uniformly. Layer 0's input here is
+    // a compute PASS, not the upload copy the toolkit's chain assumed, so its
+    // before-state is UAV, not COPY_DEST.
+    BarrierOn(g.cmd, g.texA, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     g.cmd->SetPipelineState(scaled ? g.psoToRgbaScale : g.psoToRgba);
-    g.cmd->SetComputeRootDescriptorTable(1, DescGpu(0));   // t0 = Y
-    g.cmd->SetComputeRootDescriptorTable(2, DescGpu(1));   // t1 = UV
-    g.cmd->SetComputeRootDescriptorTable(3, DescGpu(2));   // u0 = texIn
-    g.cmd->SetComputeRootDescriptorTable(4, DescGpu(2));   // u1 unused but must exist
+    g.cmd->SetComputeRootDescriptorTable(1, DescGpu(kDescSrvY));    // t0 = Y
+    g.cmd->SetComputeRootDescriptorTable(2, DescGpu(kDescSrvUV));   // t1 = UV
+    g.cmd->SetComputeRootDescriptorTable(3, DescGpu(kDescUavA));    // u0 = texA
+    g.cmd->SetComputeRootDescriptorTable(4, DescGpu(kDescUavA));    // u1 unused but must exist
     g.cmd->Dispatch((SW + 7) / 8, (SH + 7) / 8, 1);   // == (W,H) at 100%
-    BarrierOn(g.cmd, g.texIn, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-    // ---- the neural pass ----
-    BarrierOn(g.cmd, g.texOut,   D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // ---- preserve the frame as uploaded, for extrapolation ----
+    // Skipped entirely at gain 1: no copy, and the conversion shaders never read
+    // texOrig, so the off state is bit-identical to the pre-feature build.
+    const bool extrap = (g.opt.extrapPct != 100);
+    if (extrap) {
+        BarrierOn(g.cmd, g.texA, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                  D3D12_RESOURCE_STATE_COPY_SOURCE);
+        g.cmd->CopyResource(g.texOrig, g.texA);
+        // Back to UAV: layer 0's src barrier below expects exactly that state.
+        BarrierOn(g.cmd, g.texA, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        BarrierOn(g.cmd, g.texOrig, D3D12_RESOURCE_STATE_COMMON,
+                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+
+    // ---- the chain: N layers, one NGX feature each, ONE command list ----
+    // Guidance is constant across layers, so zeroMV/zeroDepth go to SRV once and
+    // back to COMMON once, not twice per layer.
     BarrierOn(g.cmd, g.zeroMV,   D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     BarrierOn(g.cmd, g.zeroDepth,D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-    g.params->Set("DLSSNR.Color",  g.texIn);
-    g.params->Set("DLSSNR.Output", g.texOut);
     g.params->Set("DLSSNR.MVec",   g.zeroMV);
     g.params->Set("DLSSNR.Depth",  g.zeroDepth);
-    g.params->Set("DLSSNR.Reset",  reset ? 1 : 0);
+    g.params->Set("DLSSNR.Reset",  reset ? 1 : 0);   // every layer restarts together
     g.params->Set("DLSSNR.ColorSubrectBaseX", 0u);
     g.params->Set("DLSSNR.ColorSubrectBaseY", 0u);
     // The network sees the WHOLE frame -- at its own size. Every subrect is the
@@ -990,30 +1363,61 @@ bool ProcessNv12(const uint8_t* inY,  int inYStride,
     g.params->Set("DLSSNR.DepthInverted", 1);
     g.params->Set("DLSSNR.Enabled", 1);
 
-    NVSDK_NGX_Result r = g.fnEval(g.cmd, g.feature, g.params, nullptr);
-    if (r != NVSDK_NGX_Result_Success) {
-        ELog("EvaluateFeature 0x%08X at %ux%u (video %ux%u)", (unsigned)r, SW, SH, W, H);
-        g.cmd->Close();
-        return false;
+    // Ping-pong. texA holds the NV12->RGBA result; each layer writes the OTHER
+    // texture and the next layer reads that back. Barrier discipline per layer:
+    //   src -- the texture a UAV wrote (the conversion pass, or the previous
+    //          layer's EvaluateFeature) -> NON_PIXEL_SHADER_RESOURCE
+    //   dst -- COMMON only on layer 0; afterwards it is the SRV layer k-1 read
+    //          -> UNORDERED_ACCESS
+    // Using the wrong before-state (say "COMMON" on an already-SRV texture) is a
+    // transition mismatch: the debug layer reports it and the runtime otherwise
+    // lets it corrupt the frame.
+    ID3D12Resource* src = g.texA;
+    ID3D12Resource* dst = g.texB;
+    for (int k = 0; k < nLayers; ++k) {
+        BarrierOn(g.cmd, src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        BarrierOn(g.cmd, dst, (k == 0) ? D3D12_RESOURCE_STATE_COMMON
+                                       : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        g.params->Set("DLSSNR.Color",  src);   // bind THIS layer's in/out ...
+        g.params->Set("DLSSNR.Output", dst);
+        SetLayerParams(g.opt.layers[k]);       // ... and THIS layer's own settings
+        NVSDK_NGX_Result r = g.fnEval(g.cmd, g.features[k], g.params, nullptr);
+        if (r != NVSDK_NGX_Result_Success) {
+            ELog("EvaluateFeature layer %d 0x%08X at %ux%u (video %ux%u)",
+                 k, (unsigned)r, SW, SH, W, H);
+            g.cmd->Close();
+            return false;                      // never submit a half-chained frame
+        }
+        ID3D12Resource* t = src; src = dst; dst = t;   // next layer reads this one
     }
-    BarrierOn(g.cmd, g.texOut,    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    BarrierOn(g.cmd, g.zeroMV,    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    BarrierOn(g.cmd, g.zeroDepth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    // `src` now holds the LAST layer's output; `dst` is the texture layer n-1 read.
+    BarrierOn(g.cmd, g.zeroMV,   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    BarrierOn(g.cmd, g.zeroDepth,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 
     // ---- compute: RGBA8 -> NV12, back at the VIDEO size ----
     // When scaled, these two passes also do the upscale: the luma pass takes a
     // bilinear tap per output pixel, the chroma pass samples at the chroma
     // centre (which at 50% lands exactly on one network pixel).
+    //
+    // t0 is the LAST layer's output -- whichever ping-pong texture the chain
+    // ended on -- so its SRV slot comes from `src`, never a hard-coded texA/texB.
+    // Binding the wrong slot is exactly the "convert the input back" bug the
+    // descriptor layout warns about: the filter runs and changes nothing.
+    const int lastSrv = (src == g.texA) ? kDescSrvA : kDescSrvB;
+    BarrierOn(g.cmd, src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     BarrierOn(g.cmd, g.outYTex,  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     BarrierOn(g.cmd, g.outUVTex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     g.cmd->SetPipelineState(scaled ? g.psoYScale : g.psoY);
-    // t0 is the NEURAL OUTPUT (slot 8 = SRV texOut). Binding slot 3 here --
-    // which is texIn -- silently turns this pass into "convert the input back",
-    // i.e. the filter looks like it works and has no effect at all.
-    g.cmd->SetComputeRootDescriptorTable(1, DescGpu(8));   // t0 = texOut
-    g.cmd->SetComputeRootDescriptorTable(2, DescGpu(8));   // t1 unused but must exist
-    g.cmd->SetComputeRootDescriptorTable(3, DescGpu(4));   // u0 = outY
-    g.cmd->SetComputeRootDescriptorTable(4, DescGpu(5));   // u1 = outUV
+    g.cmd->SetComputeRootDescriptorTable(1, DescGpu(lastSrv));        // t0 = last output
+    // t1 = the frame as uploaded. It has to be BOUND in both cases (the range
+    // exists either way) but is only READ when the gain is not 1.
+    g.cmd->SetComputeRootDescriptorTable(
+        2, DescGpu(extrap ? kDescSrvOrig : lastSrv));
+    g.cmd->SetComputeRootDescriptorTable(3, DescGpu(kDescUavOutY));   // u0 = outY
+    g.cmd->SetComputeRootDescriptorTable(4, DescGpu(kDescUavOutUV));  // u1 = outUV
     g.cmd->Dispatch((W + 7) / 8, (H + 7) / 8, 1);
     g.cmd->SetPipelineState(scaled ? g.psoUVScale : g.psoUV);
     g.cmd->Dispatch((cw + 7) / 8, (ch + 7) / 8, 1);
@@ -1023,11 +1427,15 @@ bool ProcessNv12(const uint8_t* inY,  int inYStride,
     CopyFromTex(g.cmd, g.rbY,  g.outYTex,  W,  H,  g.yPitch,  DXGI_FORMAT_R8_UNORM);
     CopyFromTex(g.cmd, g.rbUV, g.outUVTex, cw, ch, g.uvPitch, DXGI_FORMAT_R8G8_UNORM);
 
-    // back to COMMON so the next frame starts from a known state
+    // back to COMMON so the next frame starts from a known state. `src` just left
+    // the conversion pass in SRV; `dst` has been in SRV since layer n-1 read it.
     BarrierOn(g.cmd, g.yTex,     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     BarrierOn(g.cmd, g.uvTex,    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    BarrierOn(g.cmd, g.texIn,    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    BarrierOn(g.cmd, g.texOut,   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    if (extrap)
+        BarrierOn(g.cmd, g.texOrig,
+                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    BarrierOn(g.cmd, src,        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    BarrierOn(g.cmd, dst,        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     BarrierOn(g.cmd, g.outYTex,  D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     BarrierOn(g.cmd, g.outUVTex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     g.cmd->Close();

@@ -1,105 +1,143 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="600" height="470" viewBox="0 0 600 470" font-family="Segoe UI, Microsoft YaHei, sans-serif">
-  <rect width="600" height="470" rx="10" fill="#161616" stroke="#2b2b2b"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="520" viewBox="0 0 600 520" font-family="Segoe UI, Microsoft YaHei, sans-serif">
+  <rect width="600" height="520" rx="10" fill="#161616" stroke="#2b2b2b"/>
   <!-- title bar -->
   <text x="14" y="26" fill="#e8e8e8" font-size="15" font-weight="600">DLSSNR 控制面板</text>
   <text x="566" y="27" fill="#c0192a" font-size="17" font-weight="700" text-anchor="middle">&#215;</text>
   <line x1="0" y1="40" x2="600" y2="40" stroke="#c0192a" stroke-opacity="0.55"/>
 
-  <!-- tab strip -->
+  <!-- tab strip (参数 is the page this figure shows) -->
   <g font-size="13" text-anchor="middle">
-    <rect x="12" y="52" width="78" height="30" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
-    <text x="51" y="72" fill="#d8d8d8">参数</text>
+    <rect x="12" y="52" width="78" height="30" rx="3" fill="#c0192a"/>
+    <text x="51" y="72" fill="#ffffff" font-weight="600">参数</text>
     <rect x="96" y="52" width="78" height="30" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
     <text x="135" y="72" fill="#d8d8d8">状态</text>
-    <rect x="180" y="52" width="78" height="30" rx="3" fill="#c0192a"/>
-    <text x="219" y="72" fill="#ffffff" font-weight="600">对比</text>
+    <rect x="180" y="52" width="78" height="30" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
+    <text x="219" y="72" fill="#d8d8d8">对比</text>
     <rect x="424" y="52" width="78" height="30" rx="3" fill="#c0192a"/>
     <text x="463" y="72" fill="#ffffff" font-weight="600">中文</text>
     <rect x="508" y="52" width="78" height="30" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
     <text x="547" y="72" fill="#d8d8d8">English</text>
   </g>
 
+  <!-- layer count stepper + current-layer strip (2 layers; layer 2 is being edited) -->
+  <g font-size="13">
+    <text x="14" y="106" fill="#e8e8e8">层数</text>
+    <rect x="96" y="88" width="26" height="26" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
+    <text x="109" y="107" fill="#d8d8d8" text-anchor="middle">−</text>
+    <rect x="126" y="88" width="34" height="26" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
+    <text x="143" y="107" fill="#e8e8e8" text-anchor="middle">2</text>
+    <rect x="164" y="88" width="26" height="26" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
+    <text x="177" y="107" fill="#d8d8d8" text-anchor="middle">+</text>
+    <rect x="200" y="88" width="26" height="26" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
+    <text x="213" y="107" fill="#d8d8d8" text-anchor="middle">1</text>
+    <rect x="230" y="88" width="26" height="26" rx="3" fill="#c0192a"/>
+    <text x="243" y="107" fill="#ffffff" font-weight="600" text-anchor="middle">2</text>
+  </g>
+  <text x="14" y="131" fill="#969696" font-size="11">每层是一次完整推理；风格、滑块和自动遮罩都作用于「当前层」。成本随层数线性增加，2–3 层是实用范围。</text>
+
   <!-- style segments -->
   <g font-size="13" text-anchor="middle">
-    <text x="14" y="105" fill="#a0a0a0" font-size="12">风格</text>
-    <rect x="96" y="88" width="86" height="26" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
-    <text x="139" y="106" fill="#d8d8d8">默认</text>
-    <rect x="188" y="88" width="86" height="26" rx="3" fill="#c0192a"/>
-    <text x="231" y="106" fill="#ffffff" font-weight="600">自然</text>
-    <rect x="280" y="88" width="86" height="26" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
-    <text x="323" y="106" fill="#d8d8d8">电影</text>
-    <rect x="372" y="88" width="86" height="26" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
-    <text x="415" y="106" fill="#d8d8d8">风格3</text>
+    <text x="14" y="158" fill="#a0a0a0" font-size="12">风格</text>
+    <rect x="96" y="140" width="86" height="26" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
+    <text x="139" y="158" fill="#d8d8d8">默认</text>
+    <rect x="188" y="140" width="86" height="26" rx="3" fill="#c0192a"/>
+    <text x="231" y="158" fill="#ffffff" font-weight="600">自然</text>
+    <rect x="280" y="140" width="86" height="26" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
+    <text x="323" y="158" fill="#d8d8d8">电影</text>
+    <rect x="372" y="140" width="86" height="26" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
+    <text x="415" y="158" fill="#d8d8d8">风格3</text>
   </g>
 
-  <!-- slider rows -->
+  <!-- slider rows: label / track / readout / per-row Reset -->
   <g font-size="13">
-    <text x="14" y="146" fill="#e8e8e8">强度</text>
-    <rect x="96" y="138" width="300" height="6" rx="3" fill="#2a2a2a"/>
-    <rect x="96" y="138" width="300" height="6" rx="3" fill="#c0192a"/>
-    <rect x="388" y="130" width="12" height="22" rx="2" fill="#d8d8d8"/>
-    <text x="418" y="146" fill="#e8e8e8">100%</text>
-    <rect x="492" y="130" width="76" height="24" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
-    <text x="530" y="147" fill="#d8d8d8" text-anchor="middle">重置</text>
+    <text x="14" y="198" fill="#e8e8e8">强度</text>
+    <rect x="96" y="190" width="300" height="6" rx="3" fill="#2a2a2a"/>
+    <rect x="96" y="190" width="300" height="6" rx="3" fill="#c0192a"/>
+    <rect x="388" y="182" width="12" height="22" rx="2" fill="#d8d8d8"/>
+    <text x="418" y="198" fill="#e8e8e8">100%</text>
+    <rect x="492" y="182" width="76" height="24" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
+    <text x="530" y="199" fill="#d8d8d8" text-anchor="middle">重置</text>
 
-    <text x="14" y="188" fill="#e8e8e8">局部色调</text>
-    <rect x="96" y="180" width="300" height="6" rx="3" fill="#2a2a2a"/>
-    <rect x="96" y="180" width="300" height="6" rx="3" fill="#c0192a"/>
-    <rect x="388" y="172" width="12" height="22" rx="2" fill="#d8d8d8"/>
-    <text x="418" y="188" fill="#e8e8e8">100%</text>
-    <rect x="492" y="172" width="76" height="24" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
-    <text x="530" y="189" fill="#d8d8d8" text-anchor="middle">重置</text>
+    <text x="14" y="240" fill="#e8e8e8">局部色调</text>
+    <rect x="96" y="232" width="300" height="6" rx="3" fill="#2a2a2a"/>
+    <rect x="96" y="232" width="300" height="6" rx="3" fill="#c0192a"/>
+    <rect x="388" y="224" width="12" height="22" rx="2" fill="#d8d8d8"/>
+    <text x="418" y="240" fill="#e8e8e8">100%</text>
+    <rect x="492" y="224" width="76" height="24" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
+    <text x="530" y="241" fill="#d8d8d8" text-anchor="middle">重置</text>
 
-    <text x="14" y="230" fill="#e8e8e8">局部结构</text>
-    <rect x="96" y="222" width="300" height="6" rx="3" fill="#2a2a2a"/>
-    <rect x="96" y="222" width="300" height="6" rx="3" fill="#c0192a"/>
-    <rect x="388" y="214" width="12" height="22" rx="2" fill="#d8d8d8"/>
-    <text x="418" y="230" fill="#e8e8e8">100%</text>
-    <rect x="492" y="214" width="76" height="24" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
-    <text x="530" y="231" fill="#d8d8d8" text-anchor="middle">重置</text>
+    <text x="14" y="282" fill="#e8e8e8">局部结构</text>
+    <rect x="96" y="274" width="300" height="6" rx="3" fill="#2a2a2a"/>
+    <rect x="96" y="274" width="300" height="6" rx="3" fill="#c0192a"/>
+    <rect x="388" y="266" width="12" height="22" rx="2" fill="#d8d8d8"/>
+    <text x="418" y="282" fill="#e8e8e8">100%</text>
+    <rect x="492" y="266" width="76" height="24" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
+    <text x="530" y="283" fill="#d8d8d8" text-anchor="middle">重置</text>
 
-    <text x="14" y="272" fill="#e8e8e8">皮肤结构</text>
-    <rect x="96" y="264" width="300" height="6" rx="3" fill="#2a2a2a"/>
-    <rect x="96" y="264" width="14" height="6" rx="3" fill="#c0192a"/>
-    <rect x="102" y="256" width="12" height="22" rx="2" fill="#d8d8d8"/>
-    <text x="418" y="272" fill="#e8e8e8">0%</text>
-    <rect x="492" y="256" width="76" height="24" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
-    <text x="530" y="273" fill="#d8d8d8" text-anchor="middle">重置</text>
+    <text x="14" y="324" fill="#e8e8e8">皮肤结构</text>
+    <rect x="96" y="316" width="300" height="6" rx="3" fill="#2a2a2a"/>
+    <rect x="96" y="316" width="14" height="6" rx="3" fill="#c0192a"/>
+    <rect x="102" y="308" width="12" height="22" rx="2" fill="#d8d8d8"/>
+    <text x="418" y="324" fill="#e8e8e8">0%</text>
+    <rect x="492" y="308" width="76" height="24" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
+    <text x="530" y="325" fill="#d8d8d8" text-anchor="middle">重置</text>
+  </g>
+
+  <!-- model row: which network inside nvngx_dlssnr.dll (session-level, like the
+       processing-resolution and extrapolation rows above it, which this
+       schematic omits: both are global knobs rather than per-layer parameters,
+       and drawing them would push every row below off the canvas. The real
+       panel has "处理分辨率" and "外推" between 皮肤结构 and 模型, each with its
+       own slider, readout and Reset.) -->
+  <g font-size="13" text-anchor="middle">
+    <text x="14" y="358" fill="#a0a0a0" font-size="12" text-anchor="start">模型</text>
+    <rect x="96" y="340" width="86" height="26" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
+    <text x="139" y="358" fill="#d8d8d8">自动</text>
+    <rect x="188" y="340" width="86" height="26" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
+    <text x="231" y="358" fill="#d8d8d8">HT</text>
+    <rect x="280" y="340" width="86" height="26" rx="3" fill="#c0192a"/>
+    <text x="323" y="358" fill="#ffffff" font-weight="600">CC-S</text>
+    <rect x="372" y="340" width="86" height="26" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
+    <text x="415" y="358" fill="#d8d8d8">预设 3</text>
   </g>
 
   <!-- checkboxes -->
   <g font-size="13" fill="#e8e8e8">
-    <rect x="14" y="300" width="18" height="18" rx="2" fill="#c0192a"/>
-    <path d="M18 309 l4 5 l7 -9" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/>
-    <text x="40" y="314">启用 DLSSNR</text>
-    <rect x="190" y="300" width="18" height="18" rx="2" fill="#1e1e1e" stroke="#4a4a4a"/>
-    <text x="216" y="314">自动遮罩</text>
-    <rect x="330" y="300" width="18" height="18" rx="2" fill="#c0192a"/>
-    <path d="M334 309 l4 5 l7 -9" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/>
-    <text x="356" y="314">启动时显示控制面板</text>
+    <rect x="14" y="394" width="18" height="18" rx="2" fill="#c0192a"/>
+    <path d="M18 403 l4 5 l7 -9" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/>
+    <text x="40" y="408">启用 DLSSNR</text>
+    <rect x="190" y="394" width="18" height="18" rx="2" fill="#1e1e1e" stroke="#4a4a4a"/>
+    <text x="216" y="408">自动遮罩</text>
+    <rect x="330" y="394" width="18" height="18" rx="2" fill="#c0192a"/>
+    <path d="M334 403 l4 5 l7 -9" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/>
+    <text x="356" y="408">启动时显示控制面板</text>
   </g>
 
   <!-- actions -->
   <g font-size="13" text-anchor="middle">
-    <rect x="14" y="336" width="118" height="28" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
-    <text x="73" y="355" fill="#d8d8d8">重置为默认</text>
-    <rect x="376" y="336" width="96" height="28" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
-    <text x="424" y="355" fill="#d8d8d8">重新检测</text>
-    <rect x="482" y="336" width="86" height="28" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
-    <text x="525" y="355" fill="#d8d8d8">打开日志</text>
+    <rect x="14" y="430" width="118" height="28" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
+    <text x="73" y="449" fill="#d8d8d8">重置为默认</text>
+    <rect x="376" y="430" width="96" height="28" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
+    <text x="424" y="449" fill="#d8d8d8">重新检测</text>
+    <rect x="482" y="430" width="86" height="28" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>
+    <text x="525" y="449" fill="#d8d8d8">打开日志</text>
   </g>
 
-  <text x="14" y="392" fill="#969696" font-size="12">参数实时生效；取消勾选「启用 DLSSNR」为真正的直通。</text>
+  <text x="14" y="488" fill="#969696" font-size="12">参数实时生效；取消勾选「启用 DLSSNR」为真正的直通。</text>
 
   <!-- annotations -->
   <g stroke="#4a90d9" stroke-width="1" fill="none">
     <path d="M219 82 L219 96" stroke-dasharray="3 3"/>
-    <path d="M139 128 L139 138" stroke-dasharray="3 3"/>
-    <path d="M73 378 L73 392" stroke-dasharray="3 3"/>
+    <path d="M262 101 L290 101" stroke-dasharray="3 3"/>
+    <path d="M139 166 L139 176" stroke-dasharray="3 3"/>
+    <path d="M323 366 L323 380" stroke-dasharray="3 3"/>
+    <path d="M73 458 L73 472" stroke-dasharray="3 3"/>
   </g>
   <g fill="#7fb3e8" font-size="11">
     <text x="228" y="96">① 第三个页签 = 暂停对比</text>
-    <text x="140" y="128">② 风格 / 滑块 / 勾选都实时生效</text>
-    <text x="80" y="378">③ 勾掉总开关＝真正直通，可同屏 A/B</text>
+    <text x="298" y="105">② 层数决定每帧跑几次完整推理，每层参数独立</text>
+    <text x="148" y="176">③ 风格 / 滑块 / 勾选都实时生效</text>
+    <text x="331" y="384">④ 模型＝DLL 里跑哪个网络，新旧可切（DLL 没带的会变灰）</text>
+    <text x="80" y="472">⑤ 勾掉总开关＝真正直通，可同屏 A/B</text>
   </g>
 </svg>
