@@ -474,6 +474,143 @@ void rgba_to_uv_scale(uint3 tid : SV_DispatchThreadID) {
 }
 )HLSL";
 
+// The edit-upsampling conversion: out = original(full res) * (N'/P) upsampled.
+//
+// This is the SDR path of RenoDX's look_upsample (src/addons/dlss5/shaders/
+// look_upsample.cs_5_1.hlsl): the ratio between the network's output and its
+// own input is upsampled and multiplied onto the untouched FULL-RESOLUTION
+// frame. Upsampling the network's OUTPUT instead -- what this filter used to
+// do, and what RenoDX calls Classic -- throws away every detail above the
+// network's resolution, which is the -38% gradient energy we measured.
+//
+// Only in-sRGB-encoded space is the ratio exact: a multiplicative gain g in
+// linear light becomes g^(1/2.2) in encoded values, and N'_enc/P_enc is
+// already exactly that, so the two gamma factors cancel and no decode is
+// needed. The joint-bilateral weights are the same shape RenoDX uses
+// (Kopf et al. 2007): spatial on the distance in network pixels, range on the
+// difference between this pixel's log2 luminance and the network pixel's
+// footprint mean. Their footprint mean is our P, which IS the box average of
+// the original at that position.
+static const char* kSrcRgbaToNv12Edit = R"HLSL(
+cbuffer Params : register(b0) { uint W; uint H; uint SW; uint SH; float Gain; uint Mode; };
+Texture2D<float4>   sNeural : register(t0);   // N'  network size
+Texture2D<float4>   sProxy  : register(t1);   // P   network size (the box average)
+Texture2D<float>    sY      : register(t2);   // the frame as uploaded, VIDEO size
+Texture2D<float2>   sUV     : register(t3);
+RWTexture2D<float>  uY   : register(u0);
+RWTexture2D<float2> uUV  : register(u1);
+
+static const float kFloor     = 1.0 / 255.0;
+static const float kSpatialSd = 0.5;    // network pixels
+static const float kRangeSd   = 0.5;    // stops
+
+float Lum(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+
+// The frame at VIDEO size, rebuilt from its own planes. This is the same round
+// trip the native path already makes (NV12 -> RGBA -> NV12); doing it inside one
+// shader is not an extra conversion. Reading the planes directly is what lets
+// this path exist at all: an RGBA copy at video size broke re-init (see the
+// note on the old texFull), and the planes are already resident.
+float3 RgbAt(int2 p) {
+    const float  y = (sY.Load(int3(p, 0)).r * 255.0 - 16.0) * 1.164;
+    const float2 c = sUV.Load(int3(p.x / 2, p.y / 2, 0)) * 255.0 - 128.0;
+    return saturate(float3(y + 1.793 * c.y,
+                           y - 0.213 * c.x - 0.533 * c.y,
+                           y + 2.112 * c.x) / 255.0);
+}
+
+// The per-network-pixel edit, as a log2 ratio, plus that pixel's footprint
+// luminance (the bilateral range term's "low" side).
+float3 EditAt(int2 p, out float guide_low) {
+    const float3 n = max(sNeural.Load(int3(p, 0)).rgb, kFloor);
+    const float3 x = max(sProxy.Load(int3(p, 0)).rgb, kFloor);
+    guide_low = log2(max(Lum(x), kFloor));
+    return log2(n) - log2(x);
+}
+
+// Pixel-centre mapping, matching the bilinear path this filter used before.
+float2 Pos(float2 pixel) {
+    const float2 scale = float2(SW, SH) / float2(W, H);
+    return (pixel + 0.5) * scale - 0.5;
+}
+
+float3 EditBilinear(float2 position) {
+    const int2 last = int2(SW, SH) - 1;
+    const float2 c = clamp(position, 0.0, (float2)last);
+    const int2 b0 = (int2)floor(c);
+    const int2 b1 = min(b0 + int2(1, 1), last);
+    const float2 f = c - (float2)b0;
+    float g;
+    const float3 e00 = EditAt(b0, g);
+    const float3 e10 = EditAt(int2(b1.x, b0.y), g);
+    const float3 e01 = EditAt(int2(b0.x, b1.y), g);
+    const float3 e11 = EditAt(b1, g);
+    return lerp(lerp(e00, e10, f.x), lerp(e01, e11, f.x), f.y);
+}
+
+// 4x4 joint bilateral over the edit, symmetric about the sample
+// (floor-1 .. floor+2) -- the window RenoDX settled on in rc6 after measuring
+// that 3x3 staircased a smooth edit ramp.
+float3 EditJoint(float2 position, float guide_full) {
+    const int2 last = int2(SW, SH) - 1;
+    const int2 base = (int2)floor(position);
+    float3 joint = 0.0, spatial = 0.0;
+    float joint_w = 0.0, spatial_w = 0.0;
+    for (int dy = -1; dy <= 2; ++dy) {
+        for (int dx = -1; dx <= 2; ++dx) {
+            const int2 tap = base + int2(dx, dy);
+            const float2 d = (float2)tap - position;
+            const float ws = exp(-dot(d, d) / (2.0 * kSpatialSd * kSpatialSd));
+            float guide_low;
+            const float3 e = EditAt(clamp(tap, int2(0, 0), last), guide_low);
+            const float dr = guide_full - guide_low;
+            const float wr = exp(-(dr * dr) / (2.0 * kRangeSd * kRangeSd));
+            joint += ws * wr * e;
+            joint_w += ws * wr;
+            spatial += ws * e;
+            spatial_w += ws;
+        }
+    }
+    // A constant edit must transport exactly, so the weights are normalised.
+    return joint_w > 1e-6 ? joint / joint_w : spatial / spatial_w;
+}
+
+float3 Composite(int2 p) {
+    const float3 orig = RgbAt(p);
+    const float2 position = Pos((float2)p);
+    const float3 e = (Mode >= 2u) ? EditJoint(position, log2(max(Lum(orig), kFloor)))
+                                  : EditBilinear(position);
+    return saturate(orig * exp2(e));
+}
+
+[numthreads(8,8,1)]
+void rgba_to_y_edit(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= W || tid.y >= H) return;
+    const float3 c = Composite((int2)tid.xy);
+    const int R = (int)(saturate(c.r) * 255.0 + 0.5);
+    const int G = (int)(saturate(c.g) * 255.0 + 0.5);
+    const int B = (int)(saturate(c.b) * 255.0 + 0.5);
+    const int Y = ((47*R + 157*G + 16*B + 128) >> 8) + 16;
+    uY[tid.xy] = (float)clamp(Y, 0, 255) / 255.0;
+}
+
+[numthreads(8,8,1)]
+void rgba_to_uv_edit(uint3 tid : SV_DispatchThreadID) {
+    const uint cw = (W + 1u) / 2u, ch = (H + 1u) / 2u;
+    if (tid.x >= cw || tid.y >= ch) return;
+    // A chroma sample covers luma [2x, 2x+2), so its centre is luma 2x+1.
+    const int2 centre = int2(tid.x * 2, tid.y * 2);
+    const float3 orig = RgbAt(centre);
+    const float3 c = Composite(centre);
+    const int R = (int)(saturate(c.r) * 255.0 + 0.5);
+    const int G = (int)(saturate(c.g) * 255.0 + 0.5);
+    const int B = (int)(saturate(c.b) * 255.0 + 0.5);
+    const int u = ((-26*R - 87*G + 112*B + 128) >> 8) + 128;
+    const int v = ((112*R - 102*G - 10*B + 128) >> 8) + 128;
+    uUV[tid.xy] = float2((float)clamp(u, 0, 255), (float)clamp(v, 0, 255)) / 255.0;
+}
+)HLSL";
+
 // --------------------------------------------------------------- state
 // Fixed descriptor-heap layout, and the single source of truth for every
 // DescGpu()/DescCpu() call -- do NOT hand-count slots at a call site. The
@@ -527,6 +664,8 @@ struct State {
     ID3D12Resource* yTex = nullptr, * uvTex = nullptr;
     ID3D12Resource* texA = nullptr, * texB = nullptr;   // RGBA8 ping-pong
     ID3D12Resource* texOrig = nullptr;                  // the frame as uploaded
+    ID3D12PipelineState* psoYEdit = nullptr;
+    ID3D12PipelineState* psoUVEdit = nullptr;
     ID3D12Resource* outYTex = nullptr, * outUVTex = nullptr;
     ID3D12Resource* zeroMV = nullptr, * zeroDepth = nullptr;
     ID3D12Resource* upY = nullptr, * upUV = nullptr;
@@ -641,27 +780,33 @@ static void CopyRows(const uint8_t* src, int srcStride, uint8_t* dst, UINT dstPi
 
 static bool CreateRootSigAndPipelines() {
     // b0 = { W, H }; four one-descriptor tables: t0, t1, u0, u1.
-    D3D12_DESCRIPTOR_RANGE ranges[4] = {};
+    D3D12_DESCRIPTOR_RANGE ranges[6] = {};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; ranges[0].NumDescriptors = 1; ranges[0].BaseShaderRegister = 0;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; ranges[1].NumDescriptors = 1; ranges[1].BaseShaderRegister = 1;
     ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; ranges[2].NumDescriptors = 1; ranges[2].BaseShaderRegister = 0;
     ranges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; ranges[3].NumDescriptors = 1; ranges[3].BaseShaderRegister = 1;
+    // t2: the frame at VIDEO size. The range must exist for the root signature,
+    // so it is bound on every dispatch; only the edit-upsampling shaders read it.
+    ranges[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; ranges[4].NumDescriptors = 1; ranges[4].BaseShaderRegister = 2;
+    // t3: the uploaded chroma plane. t2/t3 are the frame at VIDEO size, read by
+    // the edit-upsampling shaders instead of a full-size RGBA copy.
+    ranges[5].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; ranges[5].NumDescriptors = 1; ranges[5].BaseShaderRegister = 3;
 
-    D3D12_ROOT_PARAMETER rp[5] = {};
+    D3D12_ROOT_PARAMETER rp[7] = {};
     rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     rp[0].Constants.ShaderRegister = 0;
     // W, H, SW, SH and the extrapolation gain, padded to eight so the count is
     // the same on every dispatch. The native shaders ignore SW/SH.
     rp[0].Constants.Num32BitValues = 8;
     rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 6; ++i) {
         rp[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         rp[1 + i].DescriptorTable.NumDescriptorRanges = 1;
         rp[1 + i].DescriptorTable.pDescriptorRanges = &ranges[i];
         rp[1 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     }
     D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 5;
+    rs.NumParameters = 7;
     rs.pParameters = rp;
     rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
 
@@ -690,6 +835,8 @@ static bool CreateRootSigAndPipelines() {
         // Built unconditionally (they cost nothing until used) so a session can
         // be re-created at another scale without recompiling shaders.
         { kSrcNv12ToRgbaScale, "nv12_to_rgba_scale", &g.psoToRgbaScale, "nv12_to_rgba_scale" },
+        { kSrcRgbaToNv12Edit, "rgba_to_y_edit",  &g.psoYEdit,  "rgba_to_y_edit" },
+        { kSrcRgbaToNv12Edit, "rgba_to_uv_edit", &g.psoUVEdit, "rgba_to_uv_edit" },
         { kSrcRgbaToNv12Scale, "rgba_to_y_scale",    &g.psoYScale,      "rgba_to_y_scale" },
         { kSrcRgbaToNv12Scale, "rgba_to_uv_scale",   &g.psoUVScale,     "rgba_to_uv_scale" },
     };
@@ -932,9 +1079,19 @@ static bool CreateFeatureForLayer(int w, int h, const LayerOptions& L,
 
     ID3D12CommandAllocator* a = nullptr;
     ID3D12GraphicsCommandList* c = nullptr;
-    if (FAILED(g.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a))) ||
-        FAILED(g.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a, nullptr, IID_PPV_ARGS(&c)))) {
-        ELog("command list for CreateFeature failed"); return false;
+    const HRESULT hrAlloc = g.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a));
+    const HRESULT hrList = SUCCEEDED(hrAlloc)
+        ? g.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a, nullptr, IID_PPV_ARGS(&c))
+        : E_FAIL;
+    if (FAILED(hrAlloc) || FAILED(hrList)) {
+        // Log BOTH codes: "failed" on its own made a re-init failure look like a
+        // device problem when it was an allocator the previous session had not
+        // handed back.
+        ELog("command list for CreateFeature failed (allocator 0x%08X, list 0x%08X)",
+             (unsigned)hrAlloc, (unsigned)hrList);
+        if (c) { c->Release(); c = nullptr; }
+        if (a) { a->Release(); a = nullptr; }
+        return false;
     }
     NVSDK_NGX_Handle* handle = nullptr;
     NVSDK_NGX_Result r = g.fnCreate(c, (NVSDK_NGX_Feature)18, g.params, &handle);
@@ -1246,6 +1403,8 @@ void SetOptions(const Options& o) {
     // network's correction, which is not what the control says it does.
     if (g.opt.extrapPct < 100) g.opt.extrapPct = 100;
     if (g.opt.extrapPct > 400) g.opt.extrapPct = 400;
+    if (g.opt.procUps < 0) g.opt.procUps = 0;
+    if (g.opt.procUps > 2) g.opt.procUps = 2;
 }
 
 bool ProcessNv12(const uint8_t* inY,  int inYStride,
@@ -1291,6 +1450,8 @@ bool ProcessNv12(const uint8_t* inY,  int inYStride,
     const float gain = g.opt.extrapPct / 100.0f;
     UINT dims[8] = { W, H, SW, SH, 0u, 0u, 0u, 0u };
     memcpy(&dims[4], &gain, sizeof(float));   // [4] = gain, as IEEE bits
+    // [5] = which upsampling path; the edit shaders branch on it.
+    dims[5] = (UINT)(g.opt.procUps <= 0 ? 0u : (g.opt.procUps >= 2 ? 2u : 1u));
     g.cmd->SetComputeRoot32BitConstants(0, 8, dims, 0);
 
     // NV12 planes -> textures
@@ -1314,11 +1475,31 @@ bool ProcessNv12(const uint8_t* inY,  int inYStride,
     g.cmd->SetComputeRootDescriptorTable(4, DescGpu(kDescUavA));    // u1 unused but must exist
     g.cmd->Dispatch((SW + 7) / 8, (SH + 7) / 8, 1);   // == (W,H) at 100%
 
-    // ---- preserve the frame as uploaded, for extrapolation ----
-    // Skipped entirely at gain 1: no copy, and the conversion shaders never read
-    // texOrig, so the off state is bit-identical to the pre-feature build.
+    // The edit path needs nothing extra resident: it reads the frame straight
+    // from the uploaded Y/UV planes (t2/t3), which is why there is no texture to
+    // allocate and nothing to release across a session rebuild.
+    const bool editPath = scaled && g.opt.procUps != 0;
+    // Say out loud which reconstruction ran, once per change. "The switch does
+    // nothing" is otherwise indistinguishable from "the reduced session fell back
+    // to native", and that distinction is the whole diagnosis.
+    {
+        static int lastScale = -1, lastUps = -1, lastEdit = -1;
+        if (g.scalePct != lastScale || g.opt.procUps != lastUps || (int)editPath != lastEdit) {
+            lastScale = g.scalePct; lastUps = g.opt.procUps; lastEdit = (int)editPath;
+            ELog("path: scale %d%% (network %ux%u) procups %d -> %s",
+                 g.scalePct, SW, SH, g.opt.procUps,
+                 !scaled        ? "native 1:1 (no upsampling in use)"
+                 : editPath     ? (g.opt.procUps >= 2 ? "edit ratio, joint bilateral"
+                                                     : "edit ratio, bilinear")
+                                : "Classic (bilinear upsample of the output)");
+        }
+    }
     const bool extrap = (g.opt.extrapPct != 100);
-    if (extrap) {
+    const bool keepProxy = extrap || editPath;
+
+    // ---- preserve the network-size input (P) ----
+    // Read by the extrapolation term AND by the edit ratio's denominator.
+    if (keepProxy) {
         BarrierOn(g.cmd, g.texA, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                   D3D12_RESOURCE_STATE_COPY_SOURCE);
         g.cmd->CopyResource(g.texOrig, g.texA);
@@ -1410,17 +1591,30 @@ bool ProcessNv12(const uint8_t* inY,  int inYStride,
               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     BarrierOn(g.cmd, g.outYTex,  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     BarrierOn(g.cmd, g.outUVTex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    g.cmd->SetPipelineState(scaled ? g.psoYScale : g.psoY);
-    g.cmd->SetComputeRootDescriptorTable(1, DescGpu(lastSrv));        // t0 = last output
-    // t1 = the frame as uploaded. It has to be BOUND in both cases (the range
-    // exists either way) but is only READ when the gain is not 1.
+    g.cmd->SetComputeRootDescriptorTable(1, DescGpu(editPath ? lastSrv : lastSrv));  // t0 = N'
+    // t1 = the frame as uploaded at NETWORK size (P). Bound in every case (the
+    // range exists either way) but only read when extrapolating or upsampling the
+    // edit.
     g.cmd->SetComputeRootDescriptorTable(
-        2, DescGpu(extrap ? kDescSrvOrig : lastSrv));
+        2, DescGpu(keepProxy ? kDescSrvOrig : lastSrv));
     g.cmd->SetComputeRootDescriptorTable(3, DescGpu(kDescUavOutY));   // u0 = outY
     g.cmd->SetComputeRootDescriptorTable(4, DescGpu(kDescUavOutUV));  // u1 = outUV
-    g.cmd->Dispatch((W + 7) / 8, (H + 7) / 8, 1);
-    g.cmd->SetPipelineState(scaled ? g.psoUVScale : g.psoUV);
-    g.cmd->Dispatch((cw + 7) / 8, (ch + 7) / 8, 1);
+    if (editPath) {
+        // t2/t3 = the uploaded planes at VIDEO size.
+        g.cmd->SetComputeRootDescriptorTable(5, DescGpu(kDescSrvY));
+        g.cmd->SetComputeRootDescriptorTable(6, DescGpu(kDescSrvUV));
+        g.cmd->SetPipelineState(g.psoYEdit);
+        g.cmd->Dispatch((W + 7) / 8, (H + 7) / 8, 1);
+        g.cmd->SetPipelineState(g.psoUVEdit);
+        g.cmd->Dispatch((cw + 7) / 8, (ch + 7) / 8, 1);
+    } else {
+        g.cmd->SetComputeRootDescriptorTable(5, DescGpu(lastSrv));
+        g.cmd->SetComputeRootDescriptorTable(6, DescGpu(lastSrv));
+        g.cmd->SetPipelineState(scaled ? g.psoYScale : g.psoY);
+        g.cmd->Dispatch((W + 7) / 8, (H + 7) / 8, 1);
+        g.cmd->SetPipelineState(scaled ? g.psoUVScale : g.psoUV);
+        g.cmd->Dispatch((cw + 7) / 8, (ch + 7) / 8, 1);
+    }
     BarrierOn(g.cmd, g.outYTex,  D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     BarrierOn(g.cmd, g.outUVTex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
 
@@ -1431,7 +1625,7 @@ bool ProcessNv12(const uint8_t* inY,  int inYStride,
     // the conversion pass in SRV; `dst` has been in SRV since layer n-1 read it.
     BarrierOn(g.cmd, g.yTex,     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     BarrierOn(g.cmd, g.uvTex,    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    if (extrap)
+    if (keepProxy)
         BarrierOn(g.cmd, g.texOrig,
                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     BarrierOn(g.cmd, src,        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);

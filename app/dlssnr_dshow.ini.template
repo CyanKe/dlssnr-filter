@@ -163,6 +163,31 @@ procenable=0
 procscale=50
 
 ; ---------------------------------------------------------------------------
+; Upsampling -- procups
+; ---------------------------------------------------------------------------
+; How the reduced-resolution session gets back to the output size. Only
+; meaningful while procscale < 100; at 100% nothing is resampled at all.
+;
+;   2 (default) = "edge-aware edit". The ratio between the network's output and
+;                 its own input is upsampled with a 4x4 joint-bilateral filter
+;                 guided by the FULL-RESOLUTION luminance, then multiplied onto
+;                 the full-resolution frame. The frame's own detail therefore
+;                 survives: measured gradient energy at 50% goes from -38.3% of
+;                 the 100% path (mode 0) to +9.2%, and mean|d| against the 100%
+;                 output drops from 1.671 to 1.520 grey levels. This is what
+;                 RenoDX's "Edge-aware" option does (their look_upsample.cs).
+;   1 = the same, with a plain bilinear upsample of the ratio instead of the
+;       bilateral filter. +10.8% gradient energy, mean|d| 1.554. Cheap and very
+;       close; kept for A/B.
+;   0 = "Classic": bilinear upsample of the network's OUTPUT. Every detail above
+;       the network's resolution is gone, which is the -38.3% figure. This was
+;       the only behaviour before this key existed.
+;
+; All three cost the same to within the measurement resolution of this machine
+; (< 0.05 ms/frame at 1080p over 400 frames, wall clock including I/O).
+procups=2
+
+; ---------------------------------------------------------------------------
 ; Extrapolation -- extrap
 ; ---------------------------------------------------------------------------
 ; NOT a layer count, and the panel calls it 外推 / Extrapolate for that reason.

@@ -69,6 +69,9 @@ static const wchar_t* kDlssNrModelLblEn = L"Model";
 //     bit-identical on real frames, so the slider stops at 100%.
 //   * local tone / local structure: 2.0 really does keep changing the picture,
 //     so those run to 200%.
+// The upsampling row's segments: Classic / Ratio / Edge-aware. Declared up here
+// because the settings struct below sizes an array with it.
+static const int kDlssNrUpsCount = 3;
 static const int kDlssNrSliderCount = 4;
 static const int kDlssNrSliderMax[kDlssNrSliderCount] = { 100, 200, 200, 200 };
 
@@ -155,6 +158,18 @@ static void DlssNrWriteLayers() {
         dlssnr::LayerKeyName(layer1, L"skinstructure", k, _countof(k)); DlssNrIniWriteInt(k, l.pctSkin);
         dlssnr::LayerKeyName(layer1, L"automask",      k, _countof(k)); DlssNrIniWriteInt(k, l.autoMask);
     }
+}
+
+// Upsampling mode. Session-level (it changes how every frame is reconstructed,
+// not a per-layer strength), so it persists like procscale and needs no rebuild:
+// the shaders branch on a constant.
+static void DlssNrApplyProcUps(int mode, bool persist) {
+    if (mode < 0) mode = 0;
+    if (mode > 2) mode = 2;
+    Engine::Instance().SetProcUps(mode);
+    if (persist) DlssNrIniWriteInt(L"procups", mode);
+    LogRaw("ui: procups = %d", mode);
+    DlssNrRefreshSinks(persist);
 }
 
 // Extrapolation gain. Deliberately its own row and its own code path: this is
@@ -381,6 +396,10 @@ enum {
     // extrapolation it is 100 % (= off, which is the documented default).
     IDC_DLS_PROCRST   = 1133,
     IDC_DLS_EXTRAPRST = 1138,
+    // The upsampling row: which way the reduced-resolution result gets back to
+    // the output size. Segment row like 模型, not a slider.
+    IDC_DLS_UPSLBL    = 1190,
+    IDC_DLS_UPS0      = 1191,   // +0..kDlssNrUpsCount-1
     // Layer count stepper and the current-layer strip. The strip is
     // IDC_DLS_LAYER0 + i for layer i (0-based), so hit-testing the whole strip is
     // one range check -- the same shape the style segments already use.
@@ -419,6 +438,7 @@ struct DlssNrSettings {
     HWND lblProc, trkProc, valProc;  // the "processing resolution" row (25..100%)
     HWND lblExtrap, trkExtrap, valExtrap;   // extrapolation gain row (100..400%, 100 = off)
     HWND rstProc, rstExtrap;                // per-row Reset for the two global rows
+    HWND lblUps, upsBtn[kDlssNrUpsCount];   // upsampling mode segments
     // The model row: which network inside nvngx_dlssnr.dll to run. Session-level
     // like the processing-resolution row above it, and built from
     // src\dlssnr_models.h so a new network is one table row, not new plumbing.
@@ -462,6 +482,9 @@ struct DlssNrMetrics {
     int tabH;                      // tab strip height
     int margin, gap, btnGap;       // spacing
     int lblW, barW, valW, rstW;    // slider row columns
+    int upsBtnW;                   // one upsampling segment
+    int topAir;                    // gap under the tab strip, before the note
+    int noteAir;                   // gap between the note and the layer row
     int tabW, langW, styleW;       // segmented buttons
     int   headerH;                   // own title bar (borderless standalone window)
     int   closeW, closeH;            // header close button
@@ -502,6 +525,12 @@ static const wchar_t* kDlssNrProcLblEn = L"Processing res.";
 // the panel could not keep -- the numbers diverge from layer 3 on.
 static const wchar_t* kDlssNrExtrapLblZh = L"外推";
 static const wchar_t* kDlssNrExtrapLblEn = L"Extrapolate";
+// How the reduced-resolution session gets back to the output size. Only
+// meaningful while 处理分辨率 is below 100%; at 100% nothing is resampled.
+static const wchar_t* kDlssNrUpsLblZh = L"上采样";
+static const wchar_t* kDlssNrUpsLblEn = L"Upsampling";
+static const wchar_t* kDlssNrUpsSegZh[kDlssNrUpsCount] = { L"经典(不推荐)", L"比值", L"边缘感知" };
+static const wchar_t* kDlssNrUpsSegEn[kDlssNrUpsCount] = { L"Classic (not rec.)", L"Ratio", L"Edge-aware" };
 
 // The layer row's caption and its cost note. One definition each: the layout
 // measures both languages in DlssNrGetMetrics(), and Retext paints the one the
@@ -524,10 +553,13 @@ static const wchar_t* kDlssNrHintZh =
     L"参数实时生效；取消勾选「启用 DLSSNR」为真正的直通。"
     L"引擎跟不上时，可勾「丢帧保同步」或「降分辨率处理」。"
     L"「模型」选择 DLL 里的哪个网络，切换会重建会话。";
+// Kept to the SAME line count as the Chinese hint on purpose. The hint box is
+// measured across both languages (the panel does not re-measure on a language
+// switch -- it only re-texts and re-lays out at a fixed height), so a longer
+// English string adds dead space under the Chinese one forever.
 static const wchar_t* kDlssNrHintEn =
-    L"Live: uncheck Enable DLSSNR for a true pass-through. "
-    L"If the engine cannot keep up, use Drop late frames or Reduce resolution. "
-    L"Model picks which network inside the DLL to run; switching rebuilds the session.";
+    L"Live. Uncheck Enable DLSSNR to pass through. Slow? Tick Drop late frames "
+    L"or Reduce resolution. Model picks the network in the DLL.";
 
 static const wchar_t* DlssNrStyleNameLang(int i, int lang) {
     static const wchar_t* zh[kDlssNrStyleCount] = { L"默认", L"自然", L"电影", L"风格3" };
@@ -571,9 +603,15 @@ static const DlssNrMetrics& DlssNrGetMetrics() {
 
     m.margin   = S(10);
     m.gap      = S(6);
+    m.topAir   = S(10);   // the note is the first thing read; S(6) read as cramped
+    m.noteAir  = S(4);
     m.btnGap   = S(4);
     m.rowH     = m.lineH + S(6);
-    m.rowPitch = m.rowH + S(8);
+    // Vertical breathing room between parameter rows. This is the one knob that
+    // changes the panel height without touching the width: every row built on
+    // rowPitch (the four sliders, the two session rows, the extrapolation row)
+    // gains exactly this much and nothing horizontal moves.
+    m.rowPitch = m.rowH + S(12);
     m.segH     = S(22);
     m.tabH     = S(26);
     m.titleH   = S(30);
@@ -600,6 +638,7 @@ static const DlssNrMetrics& DlssNrGetMetrics() {
     m.lblW = DlssNrMax2(m.lblW, DlssNrMaxExtentLang(dc, L"皮肤结构", L"Skin structure"));
     m.lblW = DlssNrMax2(m.lblW, DlssNrMaxExtentLang(dc, kDlssNrProcLblZh, kDlssNrProcLblEn));
     m.lblW = DlssNrMax2(m.lblW, DlssNrMaxExtentLang(dc, kDlssNrExtrapLblZh, kDlssNrExtrapLblEn));
+    m.lblW = DlssNrMax2(m.lblW, DlssNrMaxExtentLang(dc, kDlssNrUpsLblZh, kDlssNrUpsLblEn));
     m.lblW += S(8);
 
     m.valW = DlssNrExtent(dc, L"200%") + S(6);
@@ -623,6 +662,11 @@ static const DlssNrMetrics& DlssNrGetMetrics() {
     }
     m.modelBtnW = DlssNrMax2(m.modelBtnW, DlssNrMaxExtentLang(dc, L"预设 8", L"Preset 8"));
     m.modelBtnW += S(16);
+    m.upsBtnW = 0;
+    for (int i = 0; i < kDlssNrUpsCount; ++i)
+        m.upsBtnW = DlssNrMax2(m.upsBtnW,
+                               DlssNrMaxExtentLang(dc, kDlssNrUpsSegZh[i], kDlssNrUpsSegEn[i]));
+    m.upsBtnW += S(16);
 
     m.chkW[0] = DlssNrMaxExtentLang(dc, L"启用 DLSSNR", L"Enable DLSSNR") + m.boxW + S(10);
     m.chkW[1] = DlssNrMaxExtentLang(dc, L"自动遮罩", L"Automatic mask") + m.boxW + S(10);
@@ -662,6 +706,17 @@ static const DlssNrMetrics& DlssNrGetMetrics() {
     const int actionRowW = m.margin * 2 + m.resetAllW + m.recheckW + m.logW + 4 * m.gap;
     if (actionRowW > m.wantW) m.wantW = actionRowW;
 
+    // Both of the wrapped blocks below are DRAWN in the small font (0.95 of the
+    // message font -- see the WM_CREATE font table), so they have to be MEASURED
+    // in it as well. They used to be measured in the message font, and at this
+    // width the 5 % difference was exactly enough to wrap the Chinese hint to
+    // three lines while it renders in two: the box then reserved a dead row and
+    // the page looked bottom-heavy with nothing in it.
+    LOGFONTW smLog = ncm.lfMessageFont;
+    smLog.lfHeight = (LONG)(ncm.lfMessageFont.lfHeight * 0.95);
+    HFONT fontSmall = CreateFontIndirectW(&smLog);
+    HGDIOBJ prevFont = fontSmall ? SelectObject(dc, fontSmall) : nullptr;
+
     // Hint: measured in both languages, wrapping inside the page width.
     const int hintW = m.wantW - 2 * m.margin;
     m.hintH = 0;
@@ -690,10 +745,15 @@ static const DlssNrMetrics& DlssNrGetMetrics() {
         m.layerNoteH += S(2);
     }
 
-    const int paramsH = m.layerRowH + m.gap                             // count + current-layer strip
-                      + m.layerNoteH + m.gap                            // per-layer cost note
+    if (prevFont) SelectObject(dc, prevFont);
+    if (fontSmall) DeleteObject(fontSmall);
+
+    const int paramsH = m.topAir                                       // air under the tab strip
+                      + m.layerNoteH + m.gap + m.noteAir                // per-layer cost note (first)
+                      + m.layerRowH + m.gap                             // count + current-layer strip
+                      + m.rowPitch                                      // extrapolation (moved up)
                       + m.segH + m.gap                                  // style row
-                      + (kDlssNrSliderCount + 2) * m.rowPitch           // sliders + processing res. + extrapolation
+                      + (kDlssNrSliderCount + 2) * m.rowPitch           // sliders + res. + upsampling
                       + m.segH + m.gap                                  // model row
                       + m.gap + 2 * m.rowH + m.gap / 2                  // two rows of checkboxes
                       + m.gap + m.segH                                  // actions
@@ -1027,10 +1087,18 @@ static void DlssNrLayout(DlssNrSettings* s) {
     MoveWindow(s->lang[1], langX + m.langW + m.btnGap, y, m.langW, m.tabH, TRUE);
 
     // ---- parameters page ----
-    y += m.tabH + m.gap;
-    // Layer row first: it scopes EVERYTHING under it (the style segments, the
-    // four sliders and the auto-mask box all edit the selected layer), so it has
-    // to read as the outermost control, not as a sidebar to the sliders.
+    // One extra gap under the tab strip: the note is the first thing read and it
+    // used to sit S(6) from the tabs, which read as cramped.
+    y += m.tabH + m.gap + m.topAir;
+    // The per-layer note comes FIRST, then the control it explains: it says what
+    // a layer costs and that everything below it is scoped to the selected one,
+    // which is only useful before you reach for the stepper.
+    MoveWindow(s->lblLayerNote, x0, y, right - x0, m.layerNoteH, TRUE);
+    y += m.layerNoteH + m.gap + m.noteAir;
+
+    // Layer row: it scopes EVERYTHING under it (the style segments, the four
+    // sliders and the auto-mask box all edit the selected layer), so it has to
+    // read as the outermost control, not as a sidebar to the sliders.
     {
         const int ry = y + (m.layerRowH - m.rowH) / 2;
         int cx = x0;
@@ -1044,8 +1112,20 @@ static void DlssNrLayout(DlssNrSettings* s) {
         }
     }
     y += m.layerRowH + m.gap;
-    MoveWindow(s->lblLayerNote, x0, y, right - x0, m.layerNoteH, TRUE);
-    y += m.layerNoteH + m.gap;
+
+    // ---- extrapolation: right under the layer count ----
+    // Next to 层数, not with the session-level rows: this is the "one pass,
+    // N passes' worth of look" control, so it belongs with the number it stands
+    // in for. The two are the same question asked two ways.
+    {
+        const int ry = y + (m.rowPitch - m.rowH) / 2;
+        int cx = x0;
+        MoveWindow(s->lblExtrap, cx, ry, m.lblW, m.rowH, TRUE);  cx += m.lblW + m.gap;
+        MoveWindow(s->trkExtrap, cx, ry, m.barW, m.rowH, TRUE);  cx += m.barW + m.gap;
+        MoveWindow(s->valExtrap, cx, ry, m.valW, m.rowH, TRUE);  cx += m.valW + m.gap;
+        MoveWindow(s->rstExtrap, cx, ry, m.rstW, m.rowH, TRUE);
+    }
+    y += m.rowPitch;
 
     // ---- style row ----
     int x = x0 + m.lblW + m.gap;
@@ -1074,17 +1154,17 @@ static void DlssNrLayout(DlssNrSettings* s) {
         MoveWindow(s->valProc, cx, ry, m.valW, m.rowH, TRUE);  cx += m.valW + m.gap;
         MoveWindow(s->rstProc, cx, ry, m.rstW, m.rowH, TRUE);
     }
-    // The extrapolation row: label / slider / readout, directly under the
-    // processing-resolution row because both are session-level knobs that are
-    // not per-layer parameters.
+    // The upsampling row follows the resolution: how small, then how to get back.
     {
         const int ry = rowTop + (kDlssNrSliderCount + 1) * m.rowPitch
-                     + (m.rowPitch - m.rowH) / 2;
+                     + (m.rowPitch - m.segH) / 2;
         int cx = x0;
-        MoveWindow(s->lblExtrap, cx, ry, m.lblW, m.rowH, TRUE);  cx += m.lblW + m.gap;
-        MoveWindow(s->trkExtrap, cx, ry, m.barW, m.rowH, TRUE);  cx += m.barW + m.gap;
-        MoveWindow(s->valExtrap, cx, ry, m.valW, m.rowH, TRUE);  cx += m.valW + m.gap;
-        MoveWindow(s->rstExtrap, cx, ry, m.rstW, m.rowH, TRUE);
+        MoveWindow(s->lblUps, cx, ry + (m.segH - m.rowH) / 2, m.lblW, m.rowH, TRUE);
+        cx += m.lblW + m.gap;
+        for (int i = 0; i < kDlssNrUpsCount; ++i) {
+            MoveWindow(s->upsBtn[i], cx, ry, m.upsBtnW, m.segH, TRUE);
+            cx += m.upsBtnW + m.btnGap;
+        }
     }
     y = rowTop + (kDlssNrSliderCount + 2) * m.rowPitch + m.gap;
 
@@ -1161,6 +1241,8 @@ static void DlssNrLayout(DlssNrSettings* s) {
     ShowWindow(s->valExtrap, show);
     ShowWindow(s->rstProc, show);
     ShowWindow(s->rstExtrap, show);
+    ShowWindow(s->lblUps, show);
+    for (int i = 0; i < kDlssNrUpsCount; ++i) ShowWindow(s->upsBtn[i], show);
     // The model row belongs to the parameter page too, for the same reason the
     // processing-resolution row does. Its segments are ENABLED per what the loaded
     // DLL carries (DlssNrSyncModelButtons), not shown/hidden: the row must keep
@@ -1213,6 +1295,7 @@ static void DlssNrRetext(HWND hwnd) {
     SetWindowTextW(s->lbl[3], T(L"皮肤结构", L"Skin structure"));
     SetWindowTextW(s->lblProc, T(kDlssNrProcLblZh, kDlssNrProcLblEn));
     SetWindowTextW(s->lblExtrap, T(kDlssNrExtrapLblZh, kDlssNrExtrapLblEn));
+    SetWindowTextW(s->lblUps, T(kDlssNrUpsLblZh, kDlssNrUpsLblEn));
     SetWindowTextW(s->lblModel, T(kDlssNrModelLblZh, kDlssNrModelLblEn));
     SetWindowTextW(s->lblLayerName, T(kDlssNrLayersLblZh, kDlssNrLayersLblEn));
     SetWindowTextW(s->lblLayerNote, T(kDlssNrLayerNoteZh, kDlssNrLayerNoteEn));
@@ -1247,6 +1330,10 @@ static const wchar_t* DlssNrButtonLabel(int id) {
     }
     if (id >= IDC_DLS_STYLE0 && id < IDC_DLS_STYLE0 + kDlssNrStyleCount)
         return DlssNrStyleName(id - IDC_DLS_STYLE0);
+    if (id >= IDC_DLS_UPS0 && id < IDC_DLS_UPS0 + kDlssNrUpsCount) {
+        const int seg = id - IDC_DLS_UPS0;
+        return T(kDlssNrUpsSegZh[seg], kDlssNrUpsSegEn[seg]);
+    }
     if (id >= IDC_DLS_MODEL0 && id < IDC_DLS_MODEL0 + kDlssNrModelBtnCount) {
         // The raw-id segment's label depends on what the panel currently holds, so
         // it needs static storage: the label is read while the button paints, and
@@ -1417,6 +1504,11 @@ static void DlssNrRefreshControls(HWND hwnd) {
     // The slider keeps its position while the switch is off (that is the value
     // the panel restores), but it is not editable until the switch is on.
     EnableWindow(s->trkProc, e.OptProcEnabled() ? TRUE : FALSE);
+    // The upsampling mode only exists while the session is reduced: at 100% there
+    // is nothing to reconstruct. Greying it (rather than silently ignoring the
+    // click) is what makes "switching does nothing" self-explanatory.
+    for (int i = 0; i < kDlssNrUpsCount; ++i)
+        EnableWindow(s->upsBtn[i], e.OptProcEnabled() ? TRUE : FALSE);
     SendMessageW(s->trkProc, TBM_SETPOS, TRUE, e.OptProcScale());
     {
         wchar_t t[16];
@@ -1883,6 +1975,14 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                      0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_PROCRST, g_hModule, nullptr);
         s->rstExtrap = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                                        0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_EXTRAPRST, g_hModule, nullptr);
+        s->lblUps = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                    0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_UPSLBL, g_hModule, nullptr);
+        for (int i = 0; i < kDlssNrUpsCount; ++i) {
+            s->upsBtn[i] = CreateWindowExW(0, L"BUTTON", L"",
+                                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                                           0, 0, 0, 0, hwnd,
+                                           (HMENU)(INT_PTR)(IDC_DLS_UPS0 + i), g_hModule, nullptr);
+        }
         s->chkEnable = CreateWindowExW(0, L"BUTTON", L"",
                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                                        0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)IDC_DLS_ENABLE, g_hModule, nullptr);
@@ -1944,6 +2044,7 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                        s->lblProc, s->trkProc, s->valProc,
         s->lblExtrap, s->trkExtrap, s->valExtrap,
         s->rstProc, s->rstExtrap,
+        s->lblUps, s->upsBtn[0], s->upsBtn[1], s->upsBtn[2],
                        s->lblModel, s->modelBtn[0], s->modelBtn[1], s->modelBtn[2], s->modelBtn[3],
                        s->btnResetAll, s->btnRecheck, s->btnLog,
                        s->lblTitle, s->lblSub, s->lblStats, s->lblGeom, s->lblLayers, s->lblHint,
@@ -1965,6 +2066,9 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // the processing-resolution row is a slider row too, so its label is bold
         SendMessageW(s->lblProc, WM_SETFONT, (WPARAM)s->fontBold, TRUE);
         SendMessageW(s->lblExtrap, WM_SETFONT, (WPARAM)s->fontBold, TRUE);
+        SendMessageW(s->lblUps, WM_SETFONT, (WPARAM)s->fontBold, TRUE);
+        for (int i = 0; i < kDlssNrUpsCount; ++i)
+            SendMessageW(s->upsBtn[i], WM_SETFONT, (WPARAM)s->fontBold, TRUE);
         // The layer row is chrome: its caption, the N readout and the buttons are
         // all bold like the other labels/segments.
         SendMessageW(s->lblLayerName, WM_SETFONT, (WPARAM)s->fontBold, TRUE);
@@ -2086,6 +2190,8 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 active = (Engine::Instance().OptSelLayer() == id - IDC_DLS_LAYER0);
             else if (id >= IDC_DLS_STYLE0 && id < IDC_DLS_STYLE0 + kDlssNrStyleCount)
                 active = (Engine::Instance().OptStyle() == id - IDC_DLS_STYLE0);
+            else if (id >= IDC_DLS_UPS0 && id < IDC_DLS_UPS0 + kDlssNrUpsCount)
+                active = (Engine::Instance().OptProcUps() == id - IDC_DLS_UPS0);
             else if (id >= IDC_DLS_MODEL0 && id < IDC_DLS_MODEL0 + kDlssNrModelBtnCount)
                 active = DlssNrModelSegActive(id - IDC_DLS_MODEL0,
                                               Engine::Instance().OptModel());
@@ -2245,6 +2351,12 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DlssNrSyncModelButtons(s);
             return 0;
         }
+        if (id >= IDC_DLS_UPS0 && id < IDC_DLS_UPS0 + kDlssNrUpsCount) {
+            DlssNrApplyProcUps(id - IDC_DLS_UPS0, true);
+            for (int i = 0; i < kDlssNrUpsCount; ++i)
+                InvalidateRect(s->upsBtn[i], nullptr, FALSE);
+            return 0;
+        }
         if (id == IDC_DLS_PROCRST) {
             // Documented default, not "off": the panel restores the value the
             // switch was designed around, and leaves the switch itself alone --
@@ -2318,6 +2430,7 @@ static LRESULT CALLBACK DlssNrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DlssNrApplyProcScale(false, 50, true);    // 50% = the value it restores to
             SendMessageW(s->trkExtrap, TBM_SETPOS, TRUE, 100);
             DlssNrApplyExtrap(100, true);             // 100 = off
+            DlssNrApplyProcUps(2, true);              // edge-aware is the default
             DlssNrRefreshControls(hwnd);
             if (s->onChanged) s->onChanged(s->onChangedCtx);
             HWND par = GetParent(hwnd);

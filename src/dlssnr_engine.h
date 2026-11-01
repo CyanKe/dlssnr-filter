@@ -88,6 +88,17 @@ struct Options {
     // geometric sum 1.80/2.40/2.85, never N itself -- k=N overshoots
     // systematically. Clamped to [100, 400] by SetOptions.
     int          extrapPct = 100;
+
+    // How the reduced-resolution path gets back to the output size.
+    //   0 = Classic: bilinear upsample of the network's OUTPUT. Loses every
+    //       detail above the network's resolution -- measured -38.3% gradient
+    //       energy at 50%.
+    //   1 = the same but upsampling the RATIO N'/P and multiplying it onto the
+    //       full-resolution frame, bilinearly.
+    //   2 = the above with a 4x4 joint-bilateral filter guided by the full-res
+    //       luminance, which is what RenoDX's Edge-aware option does.
+    // Only meaningful when procscale < 100.
+    int          procUps = 2;
 };
 
 // Creates the device and the NGX feature at this geometry. `moduleDir` must be

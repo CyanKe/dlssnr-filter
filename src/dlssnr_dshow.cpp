@@ -500,6 +500,8 @@ struct Config {
     // Extrapolation gain in percent: 100 = off. NOT a layer count -- see the
     // long note in dlssnr_engine.h. Session-level, like procEnabled.
     int   extrapPct;     // "extrap"
+    int   procUps;       // "procups": 0 = upsample the result, 1 = the edit
+                         // bilinearly, 2 = the edit with a joint-bilateral filter
     int   procScale;     // "procscale": 25..100, percent of the video size
     // Which network inside nvngx_dlssnr.dll to run ("model", 0 = the DLL's own
     // default). Session-level exactly like procScale -- DLSSNR.Hint.Render.Preset
@@ -545,6 +547,7 @@ static Config ReadConfig() {
     c.dropFrames  = true;      // on by default: without it an overloaded engine
     c.maxLagMs    = 0;         // drifts out of sync instead of dropping frames
     c.extrapPct   = 100;       // extrapolation is opt-in, and 100 IS off
+    c.procUps     = 2;         // edge-aware edit upsampling (see ENGINEERING_NOTES 12)
     c.procEnabled = false;     // reduced resolution is opt-in: it trades picture
     c.procScale   = 50;        // quality for frame rate, and 50% is the point that
                                // makes 4K60 fit (See ENGINEERING_NOTES 8)
@@ -572,6 +575,10 @@ static Config ReadConfig() {
     // telling the policy to accept a multi-second offset.
     c.maxLagMs    = iLag < 0 ? 0 : (iLag > 500 ? 500 : iLag);
     c.procEnabled = GetPrivateProfileIntW(L"DLSSNR", L"procenable", 0, ini) != 0;
+    {
+        int iUps = GetPrivateProfileIntW(L"DLSSNR", L"procups", 2, ini);
+        c.procUps = (iUps < 0) ? 0 : (iUps > 2 ? 2 : iUps);
+    }
     {
         int iEx = GetPrivateProfileIntW(L"DLSSNR", L"extrap", 100, ini);
         // Below 100 the gain would UNDO the network's correction, which is not
@@ -716,6 +723,7 @@ public:
         m_gaveUp = false;
         m_tries = 0;
         m_tryW = m_tryH = 0;
+    m_tryScale = m_tryModel = -1;
         m_failed = false;
     }
 
@@ -788,6 +796,21 @@ public:
     // read per frame in the two colour-conversion shaders, so nothing is rebuilt
     // and the picture changes on the next frame. 100 = off, and off is
     // bit-identical to the build before this feature existed.
+    // Upsampling mode for the reduced-resolution path. The shaders branch on a
+    // constant, so like SetExtrap this needs no session rebuild.
+    int   OptProcUps() { return m_procUps; }
+    void  SetProcUps(int mode) {
+        if (mode < 0) mode = 0;
+        if (mode > 2) mode = 2;
+        m_procUps = mode;
+        // Logged because "the mode stopped switching" can be a click that never
+        // arrived, a push made while the engine was rebuilding, or a push that
+        // arrived and was then overwritten -- and those need different fixes.
+        LogRaw("engine: SetProcUps(%d), ready=%d scale=%d applied=%d",
+               mode, m_ready ? 1 : 0, m_scale, m_appliedScale);
+        PushOptions(true);
+    }
+
     void SetExtrap(int pct) {
         if (pct < 100) pct = 100;
         if (pct > 400) pct = 400;
@@ -842,6 +865,7 @@ public:
         m_optProcEnabled = c.procEnabled;
         if (c.procScale >= 25 && c.procScale <= 100) m_optProcScale = c.procScale;
         m_extrapPct = (c.extrapPct < 100) ? 100 : (c.extrapPct > 400 ? 400 : c.extrapPct);
+        m_procUps   = (c.procUps < 0) ? 0 : (c.procUps > 2 ? 2 : c.procUps);
         m_optModel = dlssnr::ModelClamp(c.model);
         PushOptions(true);
     }
@@ -949,6 +973,7 @@ public:
         }
         // Global, not per layer: one extrapolation over the whole chain.
         o.extrapPct = m_extrapPct;
+        o.procUps   = m_procUps;
         return o;
     }
 
@@ -991,7 +1016,14 @@ private:
     void PushOptions(bool markDirty) {
         InterlockedIncrement(&m_paramRev);
         if (markDirty) m_optDirty = true;
-        if (!m_ready) return;
+        if (!m_ready) {
+            // Silence here is what made the rebuild case invisible: a push that
+            // lands while the engine is rebuilding is dropped on the floor, and
+            // only the next DoInit re-sends it.
+            LogRaw("engine: push skipped (not ready), procups=%d extrap=%d",
+                   m_procUps, m_extrapPct);
+            return;
+        }
         EnterCriticalSection(&m_lock);
         dlssnr::SetOptions(Opts());
         LeaveCriticalSection(&m_lock);
@@ -1031,10 +1063,11 @@ private:
             if (needInit) {
                 // A failed init must NOT be retried in a hot loop: the old code
                 // spun here thousands of times a second, pegging a core and
-                // flooding the log. After kMaxTries attempts for one geometry,
-                // stop until the geometry changes or another file is opened
-                // (Engine::NewSession clears the latch).
-                if (m_tryW == w && m_tryH == h && m_tries >= kMaxTries) {
+                // flooding the log. After kMaxTries FAILURES for one session
+                // identity, stop until that identity changes or another file is
+                // opened (Engine::NewSession clears the latch).
+                if (m_tryW == w && m_tryH == h && m_tryScale == scale &&
+                    m_tryModel == model && m_tries >= kMaxTries) {
                     if (!m_gaveUp) {
                         m_gaveUp = true;
                         LogRaw("engine: giving up on %dx%d after %d attempts "
@@ -1045,9 +1078,20 @@ private:
                     WaitForSingleObject(m_evtWake, 500);
                     continue;
                 }
-                if (m_tryW != w || m_tryH != h) { m_tryW = w; m_tryH = h; m_tries = 0; m_gaveUp = false; }
-                ++m_tries;
+                if (m_tryW != w || m_tryH != h || m_tryScale != scale || m_tryModel != model) {
+                    m_tryW = w; m_tryH = h; m_tryScale = scale; m_tryModel = model;
+                    m_tries = 0; m_gaveUp = false;
+                }
                 DoInit(w, h);
+                // Count FAILURES, never attempts. The old code incremented before
+                // every init and reset only when the geometry changed -- and the
+                // geometry of a playing file never changes, so three SUCCESSFUL
+                // rebuilds (which is exactly what flipping the resolution switch
+                // does) tripped "giving up" and froze the session until the file
+                // was reopened. That is the reported "cannot switch after one
+                // off/on": the fourth request was refused outright.
+                if (m_ready) m_tries = 0;
+                else         ++m_tries;
                 // breathe between attempts so a persistent failure stays cheap
                 if (!m_ready) Sleep(250);
             } else {
@@ -1147,7 +1191,7 @@ private:
     CRITICAL_SECTION m_lock;
     // init-attempt bookkeeping (guards against a hot retry loop on failure)
     static const int kMaxTries = 3;
-    int  m_tryW = 0, m_tryH = 0, m_tries = 0;
+    int  m_tryW = 0, m_tryH = 0, m_tryScale = -1, m_tryModel = -1, m_tries = 0;
     bool m_gaveUp = false;
     // Set by NewSession() (a player thread) and consumed by the worker, which
     // owns the actual bookkeeping fields.
@@ -1167,6 +1211,7 @@ private:
     int   m_optMaxLagMs   = 0;           // 0 = auto (one frame interval)
     bool  m_optProcEnabled = false;      // reduced-resolution switch
     int   m_extrapPct = 100;             // extrapolation gain, 100 = off
+    int   m_procUps = 2;                 // reduced-res upsample path
     int   m_optProcScale   = 50;         // its slider, 25..100 (% of the video)
     int   m_optModel       = 0;          // which network to build for (0 = default)
     volatile bool m_optDirty = false;

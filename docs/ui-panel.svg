@@ -83,12 +83,12 @@
     <text x="530" y="325" fill="#d8d8d8" text-anchor="middle">重置</text>
   </g>
 
-  <!-- model row: which network inside nvngx_dlssnr.dll (session-level, like the
-       processing-resolution and extrapolation rows above it, which this
-       schematic omits: both are global knobs rather than per-layer parameters,
-       and drawing them would push every row below off the canvas. The real
-       panel has "处理分辨率" and "外推" between 皮肤结构 and 模型, each with its
-       own slider, readout and Reset.) -->
+  <!-- model row: which network inside nvngx_dlssnr.dll. This schematic omits the
+       rows that are not per-layer parameters -- "外推" (which sits directly
+       under 层数, above the style segments), and "处理分辨率" plus "上采样"
+       (which sit between 皮肤结构 and this row) -- because drawing them would
+       push every row below off the canvas. The real panel gives each its own
+       slider or segment row, readout and Reset. -->
   <g font-size="13" text-anchor="middle">
     <text x="14" y="358" fill="#a0a0a0" font-size="12" text-anchor="start">模型</text>
     <rect x="96" y="340" width="86" height="26" rx="3" fill="#1e1e1e" stroke="#3a3a3a"/>

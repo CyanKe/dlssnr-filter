@@ -77,6 +77,7 @@ int main(int argc, char** argv) {
     std::string logPath = "frame_dump.log";
     int  skip = 8, layers = 1, style = 1, intensity = 100, tone = 100,
          strct = 100, skin = 0, automask = 0, scale = 100, extrap = 100;
+    int  procups = 0;
 
     for (int i = 6; i < argc; ++i) {
         const char* a = argv[i];
@@ -94,6 +95,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(a, "--automask"))  { automask = atoi(v);  ++i; }
         else if (!strcmp(a, "--scale"))     { scale = atoi(v);     ++i; }
         else if (!strcmp(a, "--extrap"))    { extrap = atoi(v);    ++i; }
+        else if (!strcmp(a, "--procups"))   { procups = atoi(v);   ++i; }
         else { fprintf(stderr, "unknown option %s\n", a); return 1; }
     }
     if (W <= 0 || H <= 0 || frames <= 0) { fprintf(stderr, "bad geometry/frames\n"); return 1; }
@@ -124,6 +126,7 @@ int main(int argc, char** argv) {
     dlssnr::Options opt;
     opt.layerCount = layers;
     opt.extrapPct  = extrap;   // 100 = off
+    opt.procUps    = procups;  // 0 = Classic
     for (int i = 0; i < dlssnr::kMaxLayers; ++i) {
         dlssnr::LayerOptions L;
         L.style       = style;
